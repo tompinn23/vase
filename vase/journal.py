@@ -1,123 +1,71 @@
-"""
-monitor.py - Monitor for new Journal files and contents of latest.
-
-Copyright (c) EDCD, All Rights Reserved
-Licensed under the GNU General Public License.
-See LICENSE file.
-"""
-
 import asyncio
 import json
-import logging
+import os
 import pathlib
 import re
-import sys
-import threading
+import time
 from calendar import timegm
 from collections import defaultdict
-from os import SEEK_END, SEEK_SET, listdir
-from os.path import basename, expanduser, getctime, isdir, join
-from time import gmtime, localtime, mktime, sleep, strftime, strptime, time
-from typing import TYPE_CHECKING, Any, BinaryIO, MutableMapping
 from importlib.resources import read_text
+from os import SEEK_SET
+from os.path import isdir
+from time import strptime, mktime, strftime, gmtime
+from typing import MutableMapping, Any, AsyncGenerator
 
+import anyio
+import orjson
 import psutil
 import semantic_version
+from anyio import AsyncFile
+from watchfiles import awatch, Change
 
-from vase import data
+from vase import data, api
 from vase.config import config, appname, appversion
 from vase.edmc_data import edmc_suit_shortnames, edmc_suit_symbol_localised, ship_name_map
 
 ship_data = read_text(data, "ships.json")
 ships = json.loads(ship_data)
 
-
+import logging
 logger = logging.getLogger(__name__)
-STARTUP = 'journal.startup'
+
 MAX_NAVROUTE_DISCREPANCY = 5  # Timestamp difference in seconds
 MAX_FCMATERIALS_DISCREPANCY = 5  # Timestamp difference in seconds
 
-if sys.platform == 'win32':
-    from watchdog.events import FileSystemEventHandler, FileSystemEvent
-    from watchdog.observers import Observer
-    from watchdog.observers.api import BaseObserver
+class Journal(api.Journal):
 
-else:
-    # Linux's inotify doesn't work over CIFS or NFS, so poll
-    FileSystemEventHandler = object  # dummy
-    if TYPE_CHECKING:
-        # this isn't ever used, but this will make type checking happy
-        from watchdog.events import FileSystemEvent
-        from watchdog.observers import Observer
-        from watchdog.observers.api import BaseObserver
-
-
-
-def ship_file_name(ship_name: str, ship_type: str) -> str:
-    """Return a ship name suitable for a filename."""
-    name = str(ship_name or ship_name_map.get(ship_type.lower(), ship_type)).strip()
-
-    # Handle suffix using Pathlib's with_suffix method
-    name = pathlib.Path(name).with_suffix("").name
-
-    # Check if the name is a reserved filename
-    if pathlib.Path(name).is_reserved():
-        name += "_"
-
-    return name.translate(
-        {ord(x): "_" for x in ("\0", "<", ">", ":", '"', "/", "\\", "|", "?", "*")}
-    )
-
-# Journal handler
-class EDLogs(FileSystemEventHandler):
-    """Monitoring of Journal files."""
-
-    # Magic with FileSystemEventHandler can confuse type checkers when they do not have access to every import
-    _POLL = 1		# Polling while running is cheap, so do it often
-    _INACTIVE_POLL = 10		# Polling while not running isn't as cheap, so do it less often
+    _RE_LOGFILE = re.compile(r"^Journal.(\d{4}-\d{2}-\d{2}T\d{6}).\d{2}.log$")
     _RE_CANONICALISE = re.compile(r'\$(.+)_name;')
     _RE_CATEGORY = re.compile(r'\$MICRORESOURCE_CATEGORY_(.+);')
-    _RE_LOGFILE = re.compile(r'^Journal(Alpha|Beta)?\.[0-9]{2,4}(-)?[0-9]{2}(-)?[0-9]{2}(T)?[0-9]{2}[0-9]{2}[0-9]{2}'
-                             r'\.[0-9]{2}\.log$')
     _RE_SHIP_ONFOOT = re.compile(r'^(FlightSuit|UtilitySuit_Class.|TacticalSuit_Class.|ExplorationSuit_Class.)$')
     _RE_FC_JUMP_NAME = re.compile(r'^FC ([A-NP-Z0-9]{3})([A-NP-Z0-9]{3})$')
-    _RE_JOURNAL_PATH = re.compile(r'^C:\\Users\\(.*)\\Saved Games\\Frontier Developments\\Elite Dangerous')
 
-    def __init__(self) -> None:
-        # TODO(A_D): A bunch of these should be switched to default values (eg '' for strings) and no longer be Optional
-        FileSystemEventHandler.__init__(self)  # futureproofing - not need for current version of watchdog
-        self.currentdir: str | None = None  # The actual logdir that we're monitoring
-        self.logfile: str | None = None
-        self.observer: BaseObserver | None = None
-        self.observed = None  # a watchdog ObservedWatch, or None if polling
-        self.thread: threading.Thread | None = None
-        # For communicating journal entries back to main thread
-        self.event_queue: asyncio.Queue = asyncio.Queue()
-        self.loop: asyncio.AbstractEventLoop | None = None
-        # On startup we might be:
-        # 1) Looking at an old journal file because the game isn't running or the user has exited to the main menu.
-        # 2) Looking at an empty journal (only 'Fileheader') because the user is at the main menu.
-        # 3) In the middle of a 'live' game.
-        # If 1 or 2 a LoadGame event will happen when the game goes live.
-        # If 3 we need to inject a special 'StartUp' event since consumers won't see the LoadGame event.
-        self.live = False
-        # And whilst we're parsing *only to catch up on state*, we might not want to fully process some things
-        self.catching_up = False
+    def __init__(self, journal_dir: pathlib.Path | None = None) -> None:
 
-        self.game_was_running = False  # For generation of the "ShutDown" event
+        self.version_semantic = None
+        self.game_was_running = None
         self.running_process = None
+        self.journal_dir: pathlib.Path = config.default_journal_dir
 
-        # Context for journal handling
-        self.version: str | None = None
-        self.version_semantic: semantic_version.Version | None = None
-        self.is_beta = False
+        if journal_dir is not None:
+            self.journal_dir = journal_dir
+
+        self.logfile: str | None = None
+        self.event_queue: asyncio.Queue = asyncio.Queue()
+        self.stop_event: asyncio.Event = asyncio.Event()
+        self.live = False
+        self.replay = False
+
         self.mode: str | None = None
         self.group: str | None = None
-        self.cmdr: str | None = None
-        self.started: int | None = None  # Timestamp of the LoadGame event
+        self._cmdr: str | None = None
+        self.started: int | None = None
         self.slef: str | None = None
+        self.stationservices = None
 
-        self.carrier_ids: dict[int, str] = {}
+        self.session_start: int = int(time.time())
+        self.status: dict[str, Any] = {}
+
 
         self._navroute_retries_remaining = 0
         self._last_navroute_journal_timestamp: float | None = None
@@ -125,16 +73,12 @@ class EDLogs(FileSystemEventHandler):
         self._fcmaterials_retries_remaining = 0
         self._last_fcmaterials_journal_timestamp: float | None = None
 
-        # For determining Live versus Legacy galaxy.
-        # The assumption is gameversion will parse via `coerce()` and always
-        # be >= for Live, and < for Legacy.
+        self.carrier_ids: dict[int, str] = {}
         self.live_galaxy_base_version = semantic_version.Version('4.0.0')
 
         self.__init_state()
 
-    def __init_state(self) -> None:
-        # Cmdr state shared with EDSM and plugins
-        # If you change anything here update PLUGINS.md documentation!
+    def __init_state(self):
         self.state: dict = {
             'GameLanguage':       None,  # From `Fileheader
             'GameVersion':        None,  # From `Fileheader
@@ -208,371 +152,125 @@ class EDLogs(FileSystemEventHandler):
             },
         }
 
-    def start(self, loop: asyncio.AbstractEventLoop, journaldir: str, name : str | None = None) -> bool:  # noqa: CCR001
-        """
-        Start journal monitoring.
-
-        :param: str - Journal directory.
-        :return: bool - False if we couldn't access/find latest Journal file.
-        """
-        logger.debug('Begin...')
-        self.loop = loop
-        journal_dir = journaldir
-
-        if journal_dir == '' or journal_dir is None:
-            journal_dir = config.default_journal_dir
-
-        if name is None:
-            match = self._RE_JOURNAL_PATH.match(journal_dir)
-            if match is None:
-                name = ""
-            else:
-                name = match.group(1)
+    # Public API (for plugin usage)
+    @property
+    def cmdr(self) -> str:
+        return self._cmdr
 
 
-        logdir = expanduser(journal_dir)
 
-        if not logdir or not isdir(logdir):
-            logger.error(f'Journal Directory is invalid: "{logdir}"')
-            self.stop()
-            return False
-
-        if self.currentdir and self.currentdir != logdir:
-            logger.debug(f'Journal Directory changed?  Was "{self.currentdir}", now "{logdir}"')
-            self.stop()
-
-        self.currentdir = logdir
-
-        # Latest pre-existing logfile - e.g. if E:D is already running.
-        # Do this before setting up the observer in case the journal directory has gone away
-        try:  # TODO: This should be replaced with something specific ONLY wrapping listdir
-            self.logfile = self.journal_newest_filename(self.currentdir)
-
-        except Exception:
-            logger.exception('Failed to find latest logfile')
-            self.logfile = None
-            return False
-
-        # Set up a watchdog observer.
-        # File system events are unreliable/non-existent over network drives on Linux.
-        # We can't easily tell whether a path points to a network drive, so assume
-        # any non-standard logdir might be on a network drive and poll instead.
-        polling = bool(config.get_str('journaldir')) and sys.platform != 'win32'
-        if not polling and not self.observer:
-            logger.debug('Not polling, no observer, starting an observer...')
-            self.observer = Observer()
-            self.observer.daemon = True
-            self.observer.start()
-            logger.debug('Done')
-
-        elif polling and self.observer:
-            logger.debug('Polling, but observer, so stopping observer...')
-            self.observer.stop()
-            self.observer = None
-            logger.debug('Done')
-
-        if not self.observed and not polling:
-            logger.debug('Not observed and not polling, setting observed...')
-            self.observed = self.observer.schedule(self, self.currentdir)  # type: ignore
-            logger.debug('Done')
-
-        logger.info(f'{"Polling" if polling else "Monitoring"} Journal Folder: "{self.currentdir}"')
-        logger.info(f'Start Journal File: "{self.logfile}"')
-
-        if not self.running():
-            logger.debug('Starting Journal worker thread...')
-            self.thread = threading.Thread(target=self.worker, name=f'Journal worker {name}')
-            self.thread.daemon = True
-            self.thread.start()
-            logger.debug('Done')
-
-        logger.debug('Done.')
-        return True
-
-    def journal_newest_filename(self, journals_dir) -> str | None:
-        """
-        Determine the newest Journal file name.
-
-        :param journals_dir: The directory to check
-        :return: The `str` form of the full path to the newest Journal file
-        """
-        # os.listdir(None) returns CWD's contents
-        if journals_dir is None:
+    def newest_journal(self, journals_dir: pathlib.Path) -> str | None:
+        try:
+            files = [
+                journals_dir / x
+                for x in os.listdir(journals_dir)
+                if self._RE_LOGFILE.search(x)
+            ]
+        except (OSError, AttributeError, TypeError) as e:
+            logger.exception(f'Failed to find latest journal in {journals_dir} {e}')
             return None
 
-        journal_files = (x for x in listdir(journals_dir) if self._RE_LOGFILE.search(x))
-        if journal_files:
-            # Odyssey Update 11 has, e.g.    Journal.2022-03-15T152503.01.log
-            # Horizons Update 11 equivalent: Journal.220315152335.01.log
-            # So we can no longer use a naive sort.
-            journals_dir_path = pathlib.Path(journals_dir)
-            journal_files = (journals_dir_path / pathlib.Path(x) for x in journal_files)
-            return str(max(journal_files, key=getctime))
+        if not files:
+            return None
 
-        return None
+        return str(max(files))
 
-    def stop(self) -> None:
-        """Stop journal monitoring."""
-        logger.debug('Stopping monitoring Journal')
+    def watch_filter(self, change: Change, path: str) -> bool:
+        if change == Change.modified and path == self.logfile:
+            return True
+        elif change == Change.added:
+            return True
+        return False
 
-        self.currentdir = None
-        self.version = None
-        self.version_semantic = None
-        self.mode = None
-        self.group = None
-        self.cmdr = None
-        self.state['SystemAddress'] = None
-        self.state['SystemName'] = None
-        self.state['SystemPopulation'] = None
-        self.state['StarPos'] = None
-        self.state['Body'] = None
-        self.state['BodyID'] = None
-        self.state['BodyType'] = None
-        self.state['StationName'] = None
-        self.state['MarketID'] = None
-        self.state['StationType'] = None
-        self.stationservices = None
-        self.is_beta = False
-        self.state['OnFoot'] = False
-        self.state['IsDocked'] = False
+    async def start(self) -> AsyncGenerator[MutableMapping[str, Any], None]:
+        if not isdir(self.journal_dir):
+            logger.error(f'{self.journal_dir} is not a directory')
+            return
 
-        if self.observed:
-            logger.debug('self.observed: Calling unschedule_all()')
-            self.observed = None
-            if self.observer is None:
-                raise RuntimeError("Observer was None but it is in use?")
-            self.observer.unschedule_all()
-            logger.debug('Done')
+        self.logfile = self.newest_journal(self.journal_dir)
 
-        self.thread = None  # Orphan the worker thread - will terminate at next poll
-
-        logger.debug('Done.')
-
-    def close(self) -> None:
-        """Close journal monitoring."""
-        logger.debug('Calling self.stop()...')
-        self.stop()
-        logger.debug('Done')
-
-        if self.observer:
-            logger.debug('Calling self.observer.stop()...')
-            self.observer.stop()
-            logger.debug('Done')
-
-        if self.observer:
-            logger.debug('Joining self.observer thread...')
-            self.observer.join()
-            self.observer = None
-            logger.debug('Done')
-
-        logger.debug('Done.')
-
-    def running(self) -> bool:
-        """
-        Determine if Journal watching is active.
-
-        :return: bool
-        """
-        return bool(self.thread and self.thread.is_alive())
-
-    def on_created(self, event: 'FileSystemEvent') -> None:
-        """Watchdog callback when, e.g. client (re)started."""
-        if not event.is_directory and self._RE_LOGFILE.search(str(basename(event.src_path))):
-
-            self.logfile = event.src_path  # type: ignore
-
-    def __put_entry(self, entry: bytes | str | None) -> None:
-        self.loop.call_soon_threadsafe(asyncio.create_task, self.event_queue.put(entry))
-
-    async def __put_entry_async(self, entry: bytes | str | None) -> None:
-        await self.event_queue.put(entry)
-        ##self.loop.call_soon_threadsafe(asyncio.create_task, self.event_queue.put(entry))
-
-    def worker(self) -> None:  # noqa: C901, CCR001
-        """
-        Watch latest Journal file.
-
-        1. Keep track of the latest Journal file, switching to a new one if
-          needs be.
-        2. Read in lines from the latest Journal file and queue them up for
-          get_entry() to process in the main thread.
-        """
-        # Tk isn't thread-safe in general.
-        # event_generate() is the only safe way to poke the main thread from this thread:
-        # https://mail.python.org/pipermail/tkinter-discuss/2013-November/003522.html
-
-        logger.debug(f'Starting on logfile "{self.logfile}"')
-        # Seek to the end of the latest log file
-        log_pos = -1  # make this bound, but with something that should go bang if its misused
-        logfile = self.logfile
-        if logfile:
-            loghandle: BinaryIO = open(logfile, 'rb', 0)  # unbuffered
-
-            self.catching_up = True
-            for line in loghandle:
+        logger.debug(f'Started journal at {self.logfile}')
+        log_pos = -1
+        if self.logfile:
+            loghandle: AsyncFile | None = await anyio.open_file(self.logfile, 'rb', 0)
+            self.replay = True
+            async for line in loghandle:
                 try:
                     if b'"event":"Location"' in line:
-                        logger.debug('"Location" event in the past at startup')
+                        logger.debug('"Location" event in the past')
+                    await self.parse_entry(line)
+                except Exception as e:
+                    logger.debug(f'Invalid journal entry:\n{line!r}\n', exc_info=e)
+                navroute = await self._parse_navroute_file()
+                if navroute is not None:
+                    self.state['NavRoute'] = navroute
 
-                    self.parse_entry(line)  # Some events are of interest even in the past
-
-                except Exception as ex:
-                    logger.debug(f'Invalid journal entry:\n{line!r}\n', exc_info=ex)
-
-            # One-shot attempt to read in latest NavRoute, if present
-            navroute_data = self._parse_navroute_file()
-            if navroute_data is not None:
-                # If it's NavRouteClear contents, just keep those anyway.
-                self.state['NavRoute'] = navroute_data
-
-            self.catching_up = False
-            log_pos = loghandle.tell()
-
+                self.replay = False
+                log_pos = await loghandle.tell()
         else:
-            loghandle = None  # type: ignore
+            loghandle = None
 
-        logger.debug('Now at end of latest file.')
+        logger.debug(f"End of latest journal")
 
         self.game_was_running = self.game_running()
 
         if self.live:
             if self.game_was_running:
-                logger.info("Game is/was running, so synthesizing StartUp event for plugins")
-                # Game is running locally
+                logger.info("Game is/was running, synthesizing StartUp event for plugins")
                 entry = self.synthesize_startup_event()
-
-                self.__put_entry(json.dumps(entry, separators=(',', ':')))
-                #self.event_queue.put(json.dumps(entry, separators=(', ', ':')))
-
+                yield entry
             else:
-                # Generate null event to update the display (with possibly out-of-date info)
-                self.__put_entry(None)
-                #self.event_queue.put(None)
+                yield {}
                 self.live = False
 
-        emitter = None
-        # Watchdog thread -- there is a way to get this by using self.observer.emitters and checking for an attribute:
-        # watch, but that may have unforseen differences in behaviour.
-        if self.observed:
-            if self.observer is None:
-                raise RuntimeError("Observer was None but is it in use?")
-            # Note: Uses undocumented attribute
-            emitter = self.observed and self.observer._emitter_for_watch[self.observed]
+        async for events in awatch(self.journal_dir, stop_event=self.stop_event):
+            for event, file in events:
+                name = pathlib.Path(file).name
+                if event == Change.added and self._RE_LOGFILE.search(name):
+                    if file != self.logfile: # sanity check
+                        logger.info(f"New journal file: {file} was {self.logfile}")
+                        self.logfile = file
+                        if loghandle:
+                            await loghandle.aclose()
+                        loghandle = await anyio.open_file(self.logfile, 'rb', 0)
+                        log_pos = 0
+                if event == Change.modified and file == self.logfile:
+                    await loghandle.seek(log_pos, SEEK_SET)
+                    async for line in loghandle:
+                        if b'"event":"Continue"' in line:
+                            logger.debug('Found a Continue event, its being added to the list, '
+                                         'we will finish this file up and then continue with the next')
+                        try:
+                            yield await self.parse_entry(line)
+                        except Exception as e:
+                            logger.debug(f'Invalid journal entry:\n{line!r}\n', exc_info=e)
+                    log_pos = await loghandle.tell()
+                if event in (Change.modified, Change.added) and name == 'Status.json':
+                    await self.process_status()
+                    yield self.status
+        if self.game_was_running:
+            if not self.game_running():
+                logger.info('Detected exit from game, synthesising ShutDown event')
+                timestamp = strftime('%Y-%m-%dT%H:%M:%SZ', gmtime())
+                yield {"timestamp": timestamp, "event": "ShutDown"}
 
-        logger.debug('Entering loop...')
-        while True:
-
-            # Check whether new log file started, e.g. client (re)started.
-            if emitter and emitter.is_alive():
-                new_journal_file: str | None = self.logfile  # updated by on_created watchdog callback
-
-            else:
-                # Poll
-                try:
-                    new_journal_file = self.journal_newest_filename(self.currentdir)
-
-                except Exception:
-                    logger.exception('Failed to find latest logfile')
-                    new_journal_file = None
-
-            if logfile:
-                loghandle.seek(0, SEEK_END)  # required for macOS to notice log change over SMB. TODO: Do we need this?
-                loghandle.seek(log_pos, SEEK_SET)  # reset EOF flag # TODO: log_pos reported as possibly unbound
-                for line in loghandle:
-                    # Paranoia check to see if we're shutting down
-                    if threading.current_thread() != self.thread:
-                        logger.info("We're not meant to be running, exiting...")
-                        return  # Terminate
-
-                    if b'"event":"Continue"' in line:
-                        for _ in range(10):
-                            logger.debug("****")
-                        logger.debug('Found a Continue event, its being added to the list, '
-                                        'we will finish this file up and then continue with the next')
-
-                    self.__put_entry(line)
-                    #self.event_queue.put(line)
-
-                log_pos = loghandle.tell()
-
-            if logfile != new_journal_file:
-                for _ in range(10):
-                    logger.debug("****")
-                logger.info(f'New Journal File. Was "{logfile}", now "{new_journal_file}"')
-                logfile = new_journal_file
-                if loghandle:
-                    loghandle.close()
-
-                if logfile:
-                    loghandle = open(logfile, 'rb', 0)  # unbuffered
-                    log_pos = 0
-
-            if self.game_was_running:
-                sleep(self._POLL)
-            else:
-                sleep(self._INACTIVE_POLL)
-
-            # Check whether we're still supposed to be running
-            if threading.current_thread() != self.thread:
-                logger.info("We're not meant to be running, exiting...")
-                if loghandle:
-                    loghandle.close()
-
-                return  # Terminate
-
-            if self.game_was_running:
-                if not self.game_running():
-                    logger.info('Detected exit from game, synthesising ShutDown event')
-                    timestamp = strftime('%Y-%m-%dT%H:%M:%SZ', gmtime())
-                    self.__put_entry(
-                        f'{{ "timestamp":"{timestamp}", "event":"ShutDown" }}'
-                    )
-                    #self.event_queue.put(
-                    #    f'{{ "timestamp":"{timestamp}", "event":"ShutDown" }}'
-                    #)
+    async def process_status(self):
+        try:
+            async with await anyio.open_file(self.journal_dir / 'Status.json') as f:
+                data = await f.read()
+                if data:
+                    entry = json.loads(data)
+                    entry_timestamp = timegm(time.strptime(entry['timestamp'], '%Y-%m-%dT%H:%M:%SZ'))
+                    if entry_timestamp >= self.session_start and self.status != entry:
+                        self.status = entry
+        except Exception:
+            logger.exception("Processing Status.json")
 
 
-                    self.game_was_running = False
 
-            else:
-                self.game_was_running = self.game_running()
 
-    def synthesize_startup_event(self) -> dict[str, Any]:
-        """
-        Synthesize a 'StartUp' event to notify plugins of initial state.
 
-        May be called, e.g. after 'catch up' loading of current latest
-        journal file on startup, or when a new journal file is detected without
-        the game running locally.
-
-        :return: Synthesized event as a dict
-        """
-        entry: dict[str, Any] = {
-            'timestamp':        strftime('%Y-%m-%dT%H:%M:%SZ', gmtime()),
-            'event':            'StartUp',
-            'StarSystem':       self.state['SystemName'],
-            'StarPos':          self.state['StarPos'],
-            'SystemAddress':    self.state['SystemAddress'],
-            'Population':       self.state['SystemPopulation'],
-        }
-
-        if self.state['Body']:
-            entry['Body'] = self.state['Body']
-            entry['BodyID'] = self.state['BodyID']
-            entry['BodyType'] = self.state['BodyType']
-
-        if self.state['StationName']:
-            entry['Docked'] = True
-            entry['MarketID'] = self.state['MarketID']
-            entry['StationName'] = self.state['StationName']
-            entry['StationType'] = self.state['StationType']
-
-        else:
-            entry['Docked'] = False
-
-        return entry
-
-    def parse_entry(self, line: bytes) -> MutableMapping[str, Any]:  # noqa: C901, CCR001
+    async def parse_entry(self, line: bytes) -> MutableMapping[str, Any]:  # noqa: C901, CCR001
         """
         Parse a Journal JSON line.
 
@@ -593,13 +291,13 @@ class EDLogs(FileSystemEventHandler):
             if 'timestamp' not in entry:
                 raise KeyError("Timestamp does not exist in the entry")
 
-            self.__navroute_retry()
+            await self.__navroute_retry()
 
             event_type = entry['event'].lower()
             if event_type == 'fileheader':
                 self.live = False
 
-                self.cmdr = None
+                self._cmdr = None
                 self.mode = None
                 self.group = None
                 self.state['SystemAddress'] = None
@@ -620,7 +318,7 @@ class EDLogs(FileSystemEventHandler):
 
             elif event_type == 'commander':
                 self.live = True  # First event in 3.0
-                self.cmdr = entry['Name']
+                self._cmdr = entry['Name']
                 self.state['FID'] = entry['FID']
                 logger.debug('"Commander" event, {self.cmdr=}, {self.state["FID"]=}')
 
@@ -630,7 +328,7 @@ class EDLogs(FileSystemEventHandler):
 
                 # alpha4
                 # Odyssey: bool
-                self.cmdr = entry['Commander']
+                self._cmdr = entry['Commander']
                 # 'Open', 'Solo', 'Group', or None for CQC (and Training - but no LoadGame event)
                 if not entry.get('Ship') and not entry.get('GameMode') or entry.get('GameMode', '').lower() == 'cqc':
                     logger.debug(f'loadgame to cqc: {entry}')
@@ -673,10 +371,10 @@ class EDLogs(FileSystemEventHandler):
                 if entry.get('Ship') is not None and self._RE_SHIP_ONFOOT.search(entry['Ship']):
                     self.state['OnFoot'] = True
 
-                logger.debug(f'"LoadGame" event, {self.cmdr=}, {self.state["FID"]=}')
+                logger.debug(f'"LoadGame" event, {self._cmdr=}, {self.state["FID"]=}')
 
             elif event_type == 'newcommander':
-                self.cmdr = entry['Name']
+                self._cmdr = entry['Name']
                 self.group = None
 
             elif event_type == 'setusershipname':
@@ -1150,8 +848,8 @@ class EDLogs(FileSystemEventHandler):
                 self.state['Cargo'] = defaultdict(int)
                 # From 3.3 full Cargo event (after the first one) is written to a separate file
                 if 'Inventory' not in entry:
-                    with open(join(self.currentdir, 'Cargo.json'), 'rb') as h:  # type: ignore
-                        entry = json.load(h)
+                    async with await anyio.open_file(self.journal_dir / 'Cargo.json', 'r') as h:
+                        entry = orjson.loads(await h.read())
                         self.state['CargoJSON'] = entry
 
                 clean = self.coalesce_cargo(entry['Inventory'])
@@ -1177,7 +875,7 @@ class EDLogs(FileSystemEventHandler):
                 # Always attempt loading of this, but if it fails we'll hope this was
                 # a startup/boarding version and thus `entry` contains
                 # the data anyway.
-                currentdir_path = pathlib.Path(str(self.currentdir))
+                currentdir_path = self.journal_dir
                 shiplocker_filename = currentdir_path / 'ShipLocker.json'
                 shiplocker_max_attempts = 5
                 shiplocker_fail_sleep = 0.01
@@ -1185,19 +883,19 @@ class EDLogs(FileSystemEventHandler):
                 while attempts < shiplocker_max_attempts:
                     attempts += 1
                     try:
-                        with open(shiplocker_filename, 'rb') as h:
-                            entry = json.load(h)
+                        async with await anyio.open_file(shiplocker_filename, 'r') as h:
+                            entry = json.loads(await h.read())
                             self.state['ShipLockerJSON'] = entry
                             break
 
                     except FileNotFoundError:
                         logger.warning('ShipLocker event but no ShipLocker.json file')
-                        sleep(shiplocker_fail_sleep)
+                        await anyio.sleep(shiplocker_fail_sleep)
                         pass
 
                     except json.JSONDecodeError as e:
                         logger.warning(f'ShipLocker.json failed to decode:\n{e!r}\n')
-                        sleep(shiplocker_fail_sleep)
+                        await anyio.sleep(shiplocker_fail_sleep)
                         pass
 
                 else:
@@ -1246,16 +944,17 @@ class EDLogs(FileSystemEventHandler):
 
                 # TODO: v31 doc says this is`backpack.json` ... but Howard Chalkley
                 #       said it's `Backpack.json`
-                backpack_file = pathlib.Path(str(self.currentdir)) / 'Backpack.json'
+                backpack_file = self.journal_dir / 'Backpack.json'
                 backpack_data = None
 
                 if not backpack_file.exists():
                     logger.warning(f'Failed to find backpack.json file as it appears not to exist? {backpack_file=}')
 
                 else:
-                    backpack_data = backpack_file.read_bytes()
+                    async with await anyio.open_file(backpack_file, 'r') as h:
+                        backpack_data = await h.read()
 
-                parsed = None
+                parsed: MutableMapping[str, Any] | None = None
 
                 if backpack_data is None:
                     logger.warning('Unable to read backpack data!')
@@ -1271,7 +970,7 @@ class EDLogs(FileSystemEventHandler):
                         logger.exception('Unable to parse Backpack.json')
 
                 if parsed is not None:
-                    entry = parsed  # set entry so that it ends up in plugins with the right data
+                    entry: MutableMapping[str, Any] = parsed  # set entry so that it ends up in plugins with the right data
                     # Store in monitor.state
                     self.state['BackpackJSON'] = entry
 
@@ -1601,30 +1300,30 @@ class EDLogs(FileSystemEventHandler):
                 self.state['Credits'] += entry.get('Refund', 0)
                 self.state['Taxi'] = False
 
-            elif event_type == 'navroute' and not self.catching_up:
+            elif event_type == 'navroute' and not self.replay:
                 # assume we've failed out the gate, then pull it back if things are fine
                 self._last_navroute_journal_timestamp = mktime(strptime(entry['timestamp'], '%Y-%m-%dT%H:%M:%SZ'))
                 self._navroute_retries_remaining = 11
 
                 # Added in ED 3.7 - multi-hop route details in NavRoute.json
                 # rather than duplicating this, lets just call the function
-                if self.__navroute_retry():
+                if await self.__navroute_retry():
                     entry = self.state['NavRoute']
 
-            elif event_type == 'fcmaterials' and not self.catching_up:
+            elif event_type == 'fcmaterials' and not self.replay:
                 # assume we've failed out the gate, then pull it back if things are fine
                 self._last_fcmaterials_journal_timestamp = mktime(strptime(entry['timestamp'], '%Y-%m-%dT%H:%M:%SZ'))
                 self._fcmaterials_retries_remaining = 11
 
                 # Added in ED 4.0.0.1300 - Fleet Carrier Materials market in FCMaterials.json
                 # rather than duplicating this, lets just call the function
-                if fcmaterials := self.__fcmaterials_retry():
+                if fcmaterials := await self.__fcmaterials_retry():
                     entry = fcmaterials
 
             elif event_type == 'moduleinfo':
-                with open(join(self.currentdir, 'ModulesInfo.json'), 'rb') as mf:  # type: ignore
+                async with await anyio.open_file(self.journal_dir / 'ModulesInfo.json', 'r') as mf:  # type: ignore
                     try:
-                        entry = json.load(mf)
+                        entry = json.loads(await mf.read())
 
                     except json.JSONDecodeError:
                         logger.exception('Failed decoding ModulesInfo.json')
@@ -1926,6 +1625,280 @@ class EDLogs(FileSystemEventHandler):
             logger.debug(f'Invalid journal entry:\n{line!r}\n', exc_info=ex)
             return {'event': None}
 
+    def canonicalise(self, item: str | None) -> str:
+        """
+        Produce canonical name for a ship module.
+
+        Commodities, Modules and Ships can appear in different forms e.g. "$HNShockMount_Name;", "HNShockMount",
+        and "hnshockmount", "$int_cargorack_size6_class1_name;" and "Int_CargoRack_Size6_Class1",
+        "python" and "Python", etc.
+        This returns a simple lowercased name e.g. 'hnshockmount', 'int_cargorack_size6_class1', 'python', etc
+
+        :param item: str - 'Found' name of the item.
+        :return: str - The canonical name.
+        """
+        if not item:
+            return ''
+
+        item = item.lower()
+        match = self._RE_CANONICALISE.match(item)
+
+        if match:
+            return match.group(1)
+
+        return item
+
+    def coalesce_cargo(self, raw_cargo: list[MutableMapping[str, Any]]) -> list[MutableMapping[str, Any]]:
+        """
+        Coalesce multiple entries of the same cargo into one.
+
+        This exists due to the fact that a user can accept multiple missions that all require the same cargo. On the ED
+        side, this is represented as multiple entries in the `Inventory` List with the same names etc. Just a differing
+        MissionID. We (as in EDMC Core) dont want to support the multiple mission IDs, but DO want to have correct cargo
+        counts. Thus, we reduce all existing cargo down to one total.
+        >>> test = [
+        ...     { "Name":"basicmedicines", "Name_Localised":"BM", "MissionID":684359162, "Count":147, "Stolen":0 },
+        ...     { "Name":"survivalequipment", "Name_Localised":"SE", "MissionID":684358939, "Count":147, "Stolen":0 },
+        ...     { "Name":"survivalequipment", "Name_Localised":"SE", "MissionID":684359344, "Count":36, "Stolen":0 }
+        ... ]
+        >>> Journal().coalesce_cargo(test) # doctest: +NORMALIZE_WHITESPACE
+        [{'Name': 'basicmedicines', 'Name_Localised': 'BM', 'MissionID': 684359162, 'Count': 147, 'Stolen': 0},
+        {'Name': 'survivalequipment', 'Name_Localised': 'SE', 'MissionID': 684358939, 'Count': 183, 'Stolen': 0}]
+
+        :param raw_cargo: Raw cargo data (usually from Cargo.json)
+        :return: Coalesced data
+        """
+
+        # self.state['Cargo'].update({self.canonicalise(x['Name']): x['Count'] for x in entry['Inventory']})
+        out: list[MutableMapping[str, Any]] = []
+        for inventory_item in raw_cargo:
+            if not any(self.canonicalise(x['Name']) == self.canonicalise(inventory_item['Name']) for x in out):
+                out.append(dict(inventory_item))
+                continue
+
+            # We've seen this before, update that count
+            x = list(
+                filter(lambda x: self.canonicalise(x['Name']) == self.canonicalise(inventory_item['Name']), out))
+
+            if len(x) != 1:
+                logger.debug(f'Unexpected number of items: {len(x)} where 1 was expected. {x}')
+
+            x[0]['Count'] += inventory_item['Count']
+
+        return out
+
+    async def _parse_navroute_file(self) -> dict[str, Any] | None:
+        """Read and parse NavRoute.json."""
+        try:
+            async with await anyio.open_file(self.journal_dir / 'NavRoute.json') as f:
+                raw = await f.read()
+        except FileNotFoundError:
+            #logger.warning("Couldn't open NavRoute.json.")
+            return None
+        except Exception as e:
+            logger.exception(f'Could not open navroute file. Bailing: {e}')
+            return None
+
+        try:
+            data = json.loads(raw)
+
+        except json.JSONDecodeError:
+            logger.exception('Failed to decode NavRoute.json')
+            return None
+
+        if 'timestamp' not in data:  # quick sanity check
+            return None
+
+        return data
+
+    def synthesize_startup_event(self) -> dict[str, Any]:
+        """
+        Synthesize a 'StartUp' event to notify plugins of initial state.
+
+        May be called, e.g. after 'catch up' loading of current latest
+        journal file on startup, or when a new journal file is detected without
+        the game running locally.
+
+        :return: Synthesized event as a dict
+        """
+        entry: dict[str, Any] = {
+            'timestamp':        strftime('%Y-%m-%dT%H:%M:%SZ', gmtime()),
+            'event':            'StartUp',
+            'StarSystem':       self.state['SystemName'],
+            'StarPos':          self.state['StarPos'],
+            'SystemAddress':    self.state['SystemAddress'],
+            'Population':       self.state['SystemPopulation'],
+        }
+
+        if self.state['Body']:
+            entry['Body'] = self.state['Body']
+            entry['BodyID'] = self.state['BodyID']
+            entry['BodyType'] = self.state['BodyType']
+
+        if self.state['StationName']:
+            entry['Docked'] = True
+            entry['MarketID'] = self.state['MarketID']
+            entry['StationName'] = self.state['StationName']
+            entry['StationType'] = self.state['StationType']
+
+        else:
+            entry['Docked'] = False
+
+        return entry
+
+    def game_running(self) -> bool:
+        """
+        Determine if the game is currently running.
+
+        :return: bool - True if the game is running.
+        """
+        if self.running_process:
+            p = self.running_process
+            try:
+                with p.oneshot():
+                    if p.status() not in [psutil.STATUS_RUNNING, psutil.STATUS_SLEEPING]:
+                        raise psutil.NoSuchProcess(p.pid)
+            except psutil.NoSuchProcess:
+                # Process likely expired
+                self.running_process = None
+        if not self.running_process:
+            try:
+                edmc_process = psutil.Process()
+                edmc_user = edmc_process.username()
+                for proc in psutil.process_iter(['name', 'username']):
+                    if 'EliteDangerous' in proc.info['name'] and proc.info['username'] == edmc_user:
+                        self.running_process = proc
+                        return True
+            except psutil.NoSuchProcess:
+                pass
+            return False
+        return bool(self.running_process)
+
+    @staticmethod
+    def _parse_journal_timestamp(source: str) -> float:
+        return mktime(strptime(source, '%Y-%m-%dT%H:%M:%SZ'))
+
+    async def __navroute_retry(self) -> bool:
+        """Retry reading navroute files."""
+        if self._navroute_retries_remaining == 0:
+            return False
+
+        logger.debug(f'Navroute read retry [{self._navroute_retries_remaining}]')
+        self._navroute_retries_remaining -= 1
+
+        if self._last_navroute_journal_timestamp is None:
+            logger.critical('Asked to retry for navroute but also no set time to compare? This is a bug.')
+            return False
+
+        if (file := await self._parse_navroute_file()) is None:
+            logger.debug(
+                'Failed to parse NavRoute.json. '
+                + ('Trying again' if self._navroute_retries_remaining > 0 else 'Giving up')
+            )
+            return False
+
+        # _parse_navroute_file verifies that this exists for us
+        file_time = self._parse_journal_timestamp(file['timestamp'])
+        if abs(file_time - self._last_navroute_journal_timestamp) > MAX_NAVROUTE_DISCREPANCY:
+            logger.debug(
+                f'Time discrepancy of more than {MAX_NAVROUTE_DISCREPANCY}s --'
+                f' ({abs(file_time - self._last_navroute_journal_timestamp)}).'
+                f' {"Trying again" if self._navroute_retries_remaining > 0 else "Giving up"}.'
+            )
+            return False
+
+        # Handle it being `NavRouteClear`d already
+        if file['event'].lower() == 'navrouteclear':
+            logger.info('NavRoute file contained a NavRouteClear')
+            # We do *NOT* copy into/clear the `self.state['NavRoute']`
+        else:
+            # everything is good, lets set what we need to and make sure we dont try again
+            logger.info('Successfully read NavRoute file for last NavRoute event.')
+            self.state['NavRoute'] = file
+
+        self._navroute_retries_remaining = 0
+        self._last_navroute_journal_timestamp = None
+        return True
+
+    async def __fcmaterials_retry(self) -> dict[str, Any] | None:
+        """Retry reading FCMaterials files."""
+        if self._fcmaterials_retries_remaining == 0:
+            return None
+
+        logger.debug(f'FCMaterials read retry [{self._fcmaterials_retries_remaining}]')
+        self._fcmaterials_retries_remaining -= 1
+
+        if self._last_fcmaterials_journal_timestamp is None:
+            logger.critical('Asked to retry for FCMaterials but also no set time to compare? This is a bug.')
+            return None
+
+        if (file := await self._parse_fcmaterials_file()) is None:
+            logger.debug(
+                'Failed to parse FCMaterials.json. '
+                + ('Trying again' if self._fcmaterials_retries_remaining > 0 else 'Giving up')
+            )
+            return None
+
+        # _parse_fcmaterials_file verifies that this exists for us
+        file_time = self._parse_journal_timestamp(file['timestamp'])
+        if abs(file_time - self._last_fcmaterials_journal_timestamp) > MAX_FCMATERIALS_DISCREPANCY:
+            logger.debug(
+                f'Time discrepancy of more than {MAX_FCMATERIALS_DISCREPANCY}s --'
+                f' ({abs(file_time - self._last_fcmaterials_journal_timestamp)}).'
+                f' {"Trying again" if self._fcmaterials_retries_remaining > 0 else "Giving up"}.'
+            )
+            return None
+
+        # everything is good, lets set what we need to and make sure we dont try again
+        logger.info('Successfully read FCMaterials file for last FCMaterials event.')
+        self._fcmaterials_retries_remaining = 0
+        self._last_fcmaterials_journal_timestamp = None
+        return file
+
+    async def _parse_fcmaterials_file(self) -> dict[str, Any] | None:
+        """Read and parse FCMaterials.json."""
+        try:
+
+            async with await anyio.open_file(self.journal_dir / 'FCMaterials.json') as f:
+                raw = await f.read()
+
+        except Exception as e:
+            logger.exception(f'Could not open FCMaterials file. Bailing: {e}')
+            return None
+
+        try:
+            data = json.loads(raw)
+
+        except json.JSONDecodeError:
+            logger.exception('Failed to decode FCMaterials.json')
+            return None
+
+        if 'timestamp' not in data:  # quick sanity check
+            return None
+
+        return data
+
+    def is_live_galaxy(self) -> bool:
+        """
+        Indicate if current tracking indicates Live galaxy.
+
+        NB: **MAY** be used by third-party plugins.
+
+        We assume:
+         1) `gameversion` remains something that semantic_verison.Version.coerce() can parse.
+         2) Any Live galaxy client reports a version >= the defined base version.
+         3) Any Legacy client will always report a version < that base version.
+        :return: True for Live, False for Legacy or unknown.
+        """
+        # If we don't yet know the version we can't tell, so assume the worst
+        if self.version_semantic is None:
+            return False
+
+        if self.version_semantic >= self.live_galaxy_base_version:
+            return True
+
+        return False
+
     def populate_version_info(self, entry: MutableMapping[str, str], suppress: bool = False):
         """
         Update game version information stored locally.
@@ -2157,29 +2130,6 @@ class EDLogs(FileSystemEventHandler):
         slotid = journal_loadoutid - 4293000000
         return slotid
 
-    def canonicalise(self, item: str | None) -> str:
-        """
-        Produce canonical name for a ship module.
-
-        Commodities, Modules and Ships can appear in different forms e.g. "$HNShockMount_Name;", "HNShockMount",
-        and "hnshockmount", "$int_cargorack_size6_class1_name;" and "Int_CargoRack_Size6_Class1",
-        "python" and "Python", etc.
-        This returns a simple lowercased name e.g. 'hnshockmount', 'int_cargorack_size6_class1', 'python', etc
-
-        :param item: str - 'Found' name of the item.
-        :return: str - The canonical name.
-        """
-        if not item:
-            return ''
-
-        item = item.lower()
-        match = self._RE_CANONICALISE.match(item)
-
-        if match:
-            return match.group(1)
-
-        return item
-
     def category(self, item: str) -> str:
         """
         Determine the category of an item.
@@ -2194,423 +2144,4 @@ class EDLogs(FileSystemEventHandler):
 
         return item.capitalize()
 
-    async def get_entry(self) -> MutableMapping[str, Any] | None:
-        """
-        Pull the next Journal event from the event_queue.
 
-        :return: dict representing the event
-        """
-        if self.thread is None:
-            logger.debug('Called whilst self.thread is None, returning')
-            return None
-
-        logger.debug('Begin')
-        # if self.event_queue.empty() and self.game_running():
-        #     logger.error('event_queue is empty whilst game_running, this should not happen, returning')
-        #     return None
-
-        logger.debug('event_queue NOT empty')
-        entry = self.parse_entry(await self.event_queue.get())
-
-        if entry['event'] == 'Location':
-            logger.debug('"Location" event')
-
-        if not self.live and entry['event'] not in (None, 'Fileheader', 'ShutDown'):
-            # Game not running locally, but Journal has been updated
-            self.live = True
-            entry = self.synthesize_startup_event()
-
-            await self.__put_entry_async(json.dumps(entry, separators=(', ', ':')))
-            #self.event_queue.put(json.dumps(entry, separators=(', ', ':')))
-
-        elif self.live and entry['event'] == 'Music' and entry.get('MusicTrack') == 'MainMenu':
-            ts = strftime('%Y-%m-%dT%H:%M:%SZ', gmtime())
-            await self.__put_entry_async(
-                f'{{ "timestamp":"{ts}", "event":"ShutDown" }}'
-            )
-            #self.event_queue.put(
-            #    f'{{ "timestamp":"{ts}", "event":"ShutDown" }}'
-            #)
-
-        return entry
-
-    def game_running(self) -> bool:
-        """
-        Determine if the game is currently running.
-
-        :return: bool - True if the game is running.
-        """
-        if self.running_process:
-            p = self.running_process
-            try:
-                with p.oneshot():
-                    if p.status() not in [psutil.STATUS_RUNNING, psutil.STATUS_SLEEPING]:
-                        raise psutil.NoSuchProcess(p.pid)
-            except psutil.NoSuchProcess:
-                # Process likely expired
-                self.running_process = None
-        if not self.running_process:
-            try:
-                edmc_process = psutil.Process()
-                edmc_user = edmc_process.username()
-                for proc in psutil.process_iter(['name', 'username']):
-                    if 'EliteDangerous' in proc.info['name'] and proc.info['username'] == edmc_user:
-                        self.running_process = proc
-                        return True
-            except psutil.NoSuchProcess:
-                pass
-            return False
-        return bool(self.running_process)
-
-    def ship(self, timestamped=True) -> MutableMapping[str, Any] | None:
-        """
-        Produce a subset of data for the current ship.
-
-        Return a subset of the received data describing the current ship as a Loadout event.
-
-        :param timestamped: bool - Whether to add a 'timestamp' member.
-        :return: dict
-        """
-        if not self.state['Modules']:
-            return None
-
-        standard_order = (
-            'ShipCockpit', 'CargoHatch', 'Armour', 'PowerPlant', 'MainEngines', 'FrameShiftDrive', 'LifeSupport',
-            'PowerDistributor', 'Radar', 'FuelTank'
-        )
-
-        d: MutableMapping[str, Any] = {}
-        if timestamped:
-            d['timestamp'] = strftime('%Y-%m-%dT%H:%M:%SZ', gmtime())
-
-        d['event'] = 'Loadout'
-        d['Ship'] = self.state['ShipType']
-        d['ShipID'] = self.state['ShipID']
-
-        if self.state['ShipName']:
-            d['ShipName'] = self.state['ShipName']
-
-        if self.state['ShipIdent']:
-            d['ShipIdent'] = self.state['ShipIdent']
-
-        # sort modules by slot - hardpoints, standard, internal
-        d['Modules'] = []
-
-        for slot in sorted(
-            self.state['Modules'],
-            key=lambda x: (
-                'Hardpoint' not in x,
-                len(standard_order) if x not in standard_order else standard_order.index(x),
-                'Slot' not in x,
-                x
-            )
-        ):
-
-            module = dict(self.state['Modules'][slot])
-            module.pop('Health', None)
-            module.pop('Value', None)
-            d['Modules'].append(module)
-
-        return d
-
-    def export_ship(self, filename=None) -> None:  # noqa: C901, CCR001
-        """
-        Export ship loadout as a Loadout event.
-
-        Writes either to the specified filename or to a formatted filename based on
-        the ship name and a date+timestamp.
-
-        :param filename: Name of file to write to, if not default.
-        """
-        # TODO(A_D): Some type checking has been disabled in here due to config.get getting weird outputs
-        string = json.dumps(self.ship(False), ensure_ascii=False, indent=2, separators=(',', ': '))  # pretty print
-        if filename:
-            try:
-                with open(filename, 'wt', encoding='utf-8') as h:
-                    h.write(string)
-
-            except UnicodeError:
-                logger.exception("UnicodeError writing ship loadout to specified filename with utf-8 encoding"
-                                 ", trying without..."
-                                 )
-
-                try:
-                    with open(filename, 'wt') as h:
-                        h.write(string)
-
-                except OSError:
-                    logger.exception("OSError writing ship loadout to specified filename with default encoding"
-                                     ", aborting."
-                                     )
-
-            except OSError:
-                logger.exception("OSError writing ship loadout to specified filename with utf-8 encoding, aborting.")
-
-            return
-
-        ship = ship_file_name(self.state['ShipName'], self.state['ShipType'])
-        regexp = re.compile(re.escape(ship) + r'\.\d{4}-\d\d-\d\dT\d\d\.\d\d\.\d\d\.txt')
-        oldfiles = sorted((x for x in listdir(config.get_str('outdir')) if regexp.match(x)))
-        if oldfiles:
-            try:
-                with open(join(config.get_str('outdir'), oldfiles[-1]), encoding='utf-8') as h:
-                    if h.read() == string:
-                        return  # same as last time - don't write
-
-            except UnicodeError:
-                logger.exception("UnicodeError reading old ship loadout with utf-8 encoding, trying without...")
-                try:
-                    with open(join(config.get_str('outdir'), oldfiles[-1])) as h:
-                        if h.read() == string:
-                            return  # same as last time - don't write
-
-                except OSError:
-                    logger.exception("OSError reading old ship loadout default encoding.")
-
-                except ValueError:
-                    # User was on $OtherEncoding, updated windows to be sane and use utf8 everywhere, thus
-                    # the above open() fails, likely with a UnicodeDecodeError, which subclasses UnicodeError which
-                    # subclasses ValueError, this catches ValueError _instead_ of UnicodeDecodeError just to be sure
-                    # that if some other encoding error crops up we grab it too.
-                    logger.exception('ValueError when reading old ship loadout default encoding')
-
-            except OSError:
-                logger.exception("OSError reading old ship loadout with default encoding")
-
-        # Write
-        ts = strftime('%Y-%m-%dT%H.%M.%S', localtime(time()))
-        filename = join(config.get_str('outdir'), f'{ship}.{ts}.txt')
-
-        try:
-            with open(filename, 'wt', encoding='utf-8') as h:
-                h.write(string)
-
-        except UnicodeError:
-            logger.exception("UnicodeError writing ship loadout to new filename with utf-8 encoding, trying without...")
-            try:
-                with open(filename, 'wt') as h:
-                    h.write(string)
-
-            except OSError:
-                logger.exception("OSError writing ship loadout to new filename with default encoding, aborting.")
-
-        except OSError:
-            logger.exception("OSError writing ship loadout to new filename with utf-8 encoding, aborting.")
-
-    def coalesce_cargo(self, raw_cargo: list[MutableMapping[str, Any]]) -> list[MutableMapping[str, Any]]:
-        """
-        Coalesce multiple entries of the same cargo into one.
-
-        This exists due to the fact that a user can accept multiple missions that all require the same cargo. On the ED
-        side, this is represented as multiple entries in the `Inventory` List with the same names etc. Just a differing
-        MissionID. We (as in EDMC Core) dont want to support the multiple mission IDs, but DO want to have correct cargo
-        counts. Thus, we reduce all existing cargo down to one total.
-        >>> test = [
-        ...     { "Name":"basicmedicines", "Name_Localised":"BM", "MissionID":684359162, "Count":147, "Stolen":0 },
-        ...     { "Name":"survivalequipment", "Name_Localised":"SE", "MissionID":684358939, "Count":147, "Stolen":0 },
-        ...     { "Name":"survivalequipment", "Name_Localised":"SE", "MissionID":684359344, "Count":36, "Stolen":0 }
-        ... ]
-        >>> EDLogs().coalesce_cargo(test) # doctest: +NORMALIZE_WHITESPACE
-        [{'Name': 'basicmedicines', 'Name_Localised': 'BM', 'MissionID': 684359162, 'Count': 147, 'Stolen': 0},
-        {'Name': 'survivalequipment', 'Name_Localised': 'SE', 'MissionID': 684358939, 'Count': 183, 'Stolen': 0}]
-
-        :param raw_cargo: Raw cargo data (usually from Cargo.json)
-        :return: Coalesced data
-        """
-        # self.state['Cargo'].update({self.canonicalise(x['Name']): x['Count'] for x in entry['Inventory']})
-        out: list[MutableMapping[str, Any]] = []
-        for inventory_item in raw_cargo:
-            if not any(self.canonicalise(x['Name']) == self.canonicalise(inventory_item['Name']) for x in out):
-                out.append(dict(inventory_item))
-                continue
-
-            # We've seen this before, update that count
-            x = list(filter(lambda x: self.canonicalise(x['Name']) == self.canonicalise(inventory_item['Name']), out))
-
-            if len(x) != 1:
-                logger.debug(f'Unexpected number of items: {len(x)} where 1 was expected. {x}')
-
-            x[0]['Count'] += inventory_item['Count']
-
-        return out
-
-    def suit_loadout_slots_array_to_dict(self, loadout: dict) -> dict:
-        """
-        Return a CAPI-style Suit loadout from a Journal style dict.
-
-        :param loadout: e.g. Journal 'CreateSuitLoadout'->'Modules'.
-        :return: CAPI-style dict for a suit loadout.
-        """
-        loadout_slots = {x['SlotName']: x for x in loadout}
-        slots = {}
-        for s in ('PrimaryWeapon1', 'PrimaryWeapon2', 'SecondaryWeapon'):
-            if loadout_slots.get(s) is None:
-                continue
-
-            slots[s] = {
-                'name':           loadout_slots[s]['ModuleName'],
-                'id':             None,  # FDevID ?
-                'weaponrackId':   loadout_slots[s]['SuitModuleID'],
-                'locName':        loadout_slots[s].get('ModuleName_Localised', loadout_slots[s]['ModuleName']),
-                'locDescription': '',
-                'class':          loadout_slots[s]['Class'],
-                'mods':           loadout_slots[s]['WeaponMods'],
-            }
-
-        return slots
-
-    def _parse_navroute_file(self) -> dict[str, Any] | None:
-        """Read and parse NavRoute.json."""
-        if self.currentdir is None:
-            raise ValueError('currentdir unset')
-
-        try:
-
-            with open(join(self.currentdir, 'NavRoute.json')) as f:
-                raw = f.read()
-        except FileNotFoundError:
-            logger.warning("Couldn't open NavRoute.json.")
-            return None
-        except Exception as e:
-            logger.exception(f'Could not open navroute file. Bailing: {e}')
-            return None
-
-        try:
-            data = json.loads(raw)
-
-        except json.JSONDecodeError:
-            logger.exception('Failed to decode NavRoute.json')
-            return None
-
-        if 'timestamp' not in data:  # quick sanity check
-            return None
-
-        return data
-
-    def _parse_fcmaterials_file(self) -> dict[str, Any] | None:
-        """Read and parse FCMaterials.json."""
-        if self.currentdir is None:
-            raise ValueError('currentdir unset')
-
-        try:
-
-            with open(join(self.currentdir, 'FCMaterials.json')) as f:
-                raw = f.read()
-
-        except Exception as e:
-            logger.exception(f'Could not open FCMaterials file. Bailing: {e}')
-            return None
-
-        try:
-            data = json.loads(raw)
-
-        except json.JSONDecodeError:
-            logger.exception('Failed to decode FCMaterials.json')
-            return None
-
-        if 'timestamp' not in data:  # quick sanity check
-            return None
-
-        return data
-
-    @staticmethod
-    def _parse_journal_timestamp(source: str) -> float:
-        return mktime(strptime(source, '%Y-%m-%dT%H:%M:%SZ'))
-
-    def __navroute_retry(self) -> bool:
-        """Retry reading navroute files."""
-        if self._navroute_retries_remaining == 0:
-            return False
-
-        logger.debug(f'Navroute read retry [{self._navroute_retries_remaining}]')
-        self._navroute_retries_remaining -= 1
-
-        if self._last_navroute_journal_timestamp is None:
-            logger.critical('Asked to retry for navroute but also no set time to compare? This is a bug.')
-            return False
-
-        if (file := self._parse_navroute_file()) is None:
-            logger.debug(
-                'Failed to parse NavRoute.json. '
-                + ('Trying again' if self._navroute_retries_remaining > 0 else 'Giving up')
-            )
-            return False
-
-        # _parse_navroute_file verifies that this exists for us
-        file_time = self._parse_journal_timestamp(file['timestamp'])
-        if abs(file_time - self._last_navroute_journal_timestamp) > MAX_NAVROUTE_DISCREPANCY:
-            logger.debug(
-                f'Time discrepancy of more than {MAX_NAVROUTE_DISCREPANCY}s --'
-                f' ({abs(file_time - self._last_navroute_journal_timestamp)}).'
-                f' {"Trying again" if self._navroute_retries_remaining > 0 else "Giving up"}.'
-            )
-            return False
-
-        # Handle it being `NavRouteClear`d already
-        if file['event'].lower() == 'navrouteclear':
-            logger.info('NavRoute file contained a NavRouteClear')
-            # We do *NOT* copy into/clear the `self.state['NavRoute']`
-        else:
-            # everything is good, lets set what we need to and make sure we dont try again
-            logger.info('Successfully read NavRoute file for last NavRoute event.')
-            self.state['NavRoute'] = file
-
-        self._navroute_retries_remaining = 0
-        self._last_navroute_journal_timestamp = None
-        return True
-
-    def __fcmaterials_retry(self) -> dict[str, Any] | None:
-        """Retry reading FCMaterials files."""
-        if self._fcmaterials_retries_remaining == 0:
-            return None
-
-        logger.debug(f'FCMaterials read retry [{self._fcmaterials_retries_remaining}]')
-        self._fcmaterials_retries_remaining -= 1
-
-        if self._last_fcmaterials_journal_timestamp is None:
-            logger.critical('Asked to retry for FCMaterials but also no set time to compare? This is a bug.')
-            return None
-
-        if (file := self._parse_fcmaterials_file()) is None:
-            logger.debug(
-                'Failed to parse FCMaterials.json. '
-                + ('Trying again' if self._fcmaterials_retries_remaining > 0 else 'Giving up')
-            )
-            return None
-
-        # _parse_fcmaterials_file verifies that this exists for us
-        file_time = self._parse_journal_timestamp(file['timestamp'])
-        if abs(file_time - self._last_fcmaterials_journal_timestamp) > MAX_FCMATERIALS_DISCREPANCY:
-            logger.debug(
-                f'Time discrepancy of more than {MAX_FCMATERIALS_DISCREPANCY}s --'
-                f' ({abs(file_time - self._last_fcmaterials_journal_timestamp)}).'
-                f' {"Trying again" if self._fcmaterials_retries_remaining > 0 else "Giving up"}.'
-            )
-            return None
-
-        # everything is good, lets set what we need to and make sure we dont try again
-        logger.info('Successfully read FCMaterials file for last FCMaterials event.')
-        self._fcmaterials_retries_remaining = 0
-        self._last_fcmaterials_journal_timestamp = None
-        return file
-
-    def is_live_galaxy(self) -> bool:
-        """
-        Indicate if current tracking indicates Live galaxy.
-
-        NB: **MAY** be used by third-party plugins.
-
-        We assume:
-         1) `gameversion` remains something that semantic_verison.Version.coerce() can parse.
-         2) Any Live galaxy client reports a version >= the defined base version.
-         3) Any Legacy client will always report a version < that base version.
-        :return: True for Live, False for Legacy or unknown.
-        """
-        # If we don't yet know the version we can't tell, so assume the worst
-        if self.version_semantic is None:
-            return False
-
-        if self.version_semantic >= self.live_galaxy_base_version:
-            return True
-
-        return False

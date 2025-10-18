@@ -1,25 +1,31 @@
+import argparse
 import asyncio
+import os.path
+import pathlib
+import sys
+from argparse import Namespace
 
 from typing import Iterable, MutableMapping, Any, Tuple
-
-from datetime import datetime
-
-import httpx
 import time
 
-from vase.auth import AsyncJWTAuth
-from vase.config import config
-from vase.fleets import FleetProcessor
-from vase.monitor import EDLogs
+import anyio
+
+from vase.config import config, appversion
 from colorama import Fore, Style, init
 
 import logging
 
-from vase.processor import Processor
+from vase.journal import Journal
+from vase.api.processor import Processor
+from vase.loader import load_plugins
 
 init(autoreset=True)  # reset colors automatically after each print
 PROGRAM_START = time.monotonic()
 
+class IgnoreRustNotify(logging.Filter):
+    def filter(self, record):
+        # Return True to allow, False to ignore
+        return "rust notify timeout" not in record.getMessage()
 
 class ColoredFormatter(logging.Formatter):
     LEVEL_COLORS = {
@@ -37,8 +43,6 @@ class ColoredFormatter(logging.Formatter):
         logging.ERROR: "ERROR",
     }
 
-
-
     # Logback-style pattern: "%d{HH:mm:ss.SSS} [%thread] %-5level %logger{36} - %msg%n"
     default_pattern = "{color}[{levelname}]{Style.RESET_ALL} {timestamp} {logger_name}: {msg}"
 
@@ -54,75 +58,90 @@ class ColoredFormatter(logging.Formatter):
         timestamp = "{:02d}:{:02d}:{:02d}.{:03d}".format(hours, minutes, seconds, millis)
         logger_name = record.name.split(".")[-1]
         color = self.LEVEL_COLORS.get(record.levelno, "")
-        return f"{color}{timestamp} [{self.LEVEL_NAMES.get(record.levelno, record.levelname.upper())}] {logger_name} - {record.threadName}: {record.getMessage()}"
+        return f"{color}{timestamp} [{self.LEVEL_NAMES.get(record.levelno, record.levelname.upper())}] {logger_name}: {record.getMessage()}"
 
 
 ch = logging.StreamHandler()
 ch.setFormatter(ColoredFormatter())
-logging.basicConfig(level=config.get_str("logging_level", default="INFO"), handlers=[ch])
+logging.basicConfig(level=config.get_str("log_level", default="INFO"), handlers=[ch])
 
-auth = AsyncJWTAuth()
+logging.getLogger("watchfiles.main").addFilter(IgnoreRustNotify())
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
+async def loop(processors: list[Processor], journals: Iterable[Journal]):
+    send, recv = anyio.create_memory_object_stream(0)
 
+    async def pump(journal: Journal):
+        async for event in journal.start():
+            await send.send((journal, event))
 
-async def wait_any_journal(journals: Iterable[EDLogs]) -> Tuple[EDLogs | None, MutableMapping[str, Any] | None]:
-    """Wait until any queue has an item, return (queue, item)."""
-    # Create a list of pending get() coroutines
-    getters = [asyncio.create_task(j.get_entry()) for j in journals]
+    async def safe_call(processor: Processor, journal, event):
+        try:
+            await processor.process(journal, event)
+        except Exception as e:
+            logging.exception(f"Processor {processor.name} failed: {e}")
 
-    # Wait for the first one to complete
-    done, pending = await asyncio.wait(getters, return_when=asyncio.FIRST_COMPLETED)
+    async with anyio.create_task_group() as tg:
+        for journal in journals:
+            tg.start_soon(pump, journal)
 
-    # Retrieve the result
-    done_task = done.pop()
-    item = await done_task
+        async for journal, event in recv:
+            logging.debug(f"event received: {journal.cmdr} {event}")
+            for p in processors:
+                tg.start_soon(safe_call, p, journal, event)
 
-    # Cancel remaining unfinished get()s
-    for task in pending:
-        task.cancel()
+        await send.aclose()
 
-    # Figure out which queue this came from
-    for q, t in zip(journals, getters):
-        if t is done_task:
-            return q, item
-    return None, None
-
-async def loop(processors: list[Processor], journals: Iterable[EDLogs]):
-    while True:
-        journal, entry = await wait_any_journal(journals)
-        logging.debug(f"{journal.cmdr}, {entry}")
-        tasks = [x.process(journal, entry) for x in processors]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        for i, result in enumerate(results):
-            if isinstance(result, Exception):
-                logging.error(f"Exception in processor \"{processors[i].name}\" ex:{result}")
+        # for i, result in enumerate(results):
+        #     if isinstance(result, Exception):
+        #         logging.error(f"Exception in processor \"{processors[i].name}\" ex:{result}")
 
 
-async def main():
-    async with httpx.AsyncClient(auth=auth) as client:
-        resp = await client.get("https://fleets.yonside.org/v1/auth/ping")
-        if resp.status_code != 200:
-            return
+async def main(args: Namespace):
+    logging.info(f"starting vase {appversion()} Python {sys.version}")
+
+    processors = load_plugins()
+
+    if args.save:
+        config.save()
+
+    journals = []
+    for x in args.journals:
+        logging.info(f"loading journal {x}")
+        if not os.path.exists(x):
+            logging.error(f"journal director \"{x}\" does not exist")
+            continue
+        j = Journal(x)
+        journals.append(j)
+
+    async def safe_load(proc: Processor, success: list[Processor]):
+        await proc.setup()
+        success.append(proc)
+
+    success = []
+    try:
+        async with anyio.create_task_group() as tg:
+            for x in processors:
+                tg.start_soon(safe_load, x, success)
+    except* Exception as eg:
+        for ex in eg.exceptions:
+            logging.error(ex)
 
 
-    journal = EDLogs()
-    ed2 = EDLogs()
-    evloop = asyncio.get_event_loop()
-    journal.start(evloop,"C:\\Users\\pooh\\Saved Games\\Frontier Developments\\Elite Dangerous")
-    ed2.start(evloop, "C:\\Users\\ED1\\Saved Games\\Frontier Developments\\Elite Dangerous")
-
-    fleet_processor = FleetProcessor(auth)
+    logging.info(f"starting vase with the following event processors: {[x.name for x in processors]}")
 
     try:
-        await loop([fleet_processor],[journal, ed2])
+        await loop(success,journals)
     except asyncio.CancelledError:
         pass
-    finally:
-        ed2.stop()
-        journal.stop()
 
 if __name__ == "__main__":
     try:
-        asyncio.run(main())
+        parser = argparse.ArgumentParser(prog="vase", description="Vase collects Multiple Elite Dangerous Journal Files")
+        parser.add_argument("journals", type=pathlib.Path, nargs="*", help="journal locations to process", default=[config.default_journal_dir])
+        parser.add_argument("-d", "--debug", action="store_true", help="Enable debug mode")
+        parser.add_argument("-s", "--save", action="store_true", help="Persist this config into the configuration file")
+
+        asyncio.run(main(parser.parse_args()))
     except KeyboardInterrupt:
         pass

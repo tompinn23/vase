@@ -1,14 +1,12 @@
-from cx_Freeze import setup, Executable
+from distutils.core import setup
 
-setup(
-    name="Vase",
-    version="1.0",
-    description="Vase is an Elite Dangerous Journal Processor",
-    executables=[Executable("main.py")],
-    options={
-        "build_exe": {
-            "includes": ["win32timezone"],
-            "include_files": ["ships.json"]
-        }
-    }
-)
+import py2exe
+
+setup(console=['vase/main.py'],
+      options={
+          "py2exe": {
+              "packages": ["vase.data"],  # include the package
+              "bundle_files": 1,  # optional
+          }
+      },
+      data_files=[("vase/data", ["vase/data/ships.json"])])
