@@ -1,10 +1,14 @@
 from abc import ABC, abstractmethod
 from typing import MutableMapping, Any
 
-from vase.api import Journal, JournalEvent
+from vase.api import Journal, JournalEvent, Config
 
 
 class Processor(ABC):
+    @property
+    @abstractmethod
+    def internal_name(self) -> str:
+        return "generic"
 
     @property
     @abstractmethod
@@ -12,7 +16,7 @@ class Processor(ABC):
         return "GenericProcessor"
 
     @abstractmethod
-    async def setup(self) -> None:
+    async def setup(self, config: Config) -> bool:
         """
         Perform initialization required before processing events.
 
@@ -26,8 +30,9 @@ class Processor(ABC):
 
         This coroutine should raise an exception if initialization fails; the plugin will
         not be loaded by vase if an exception is thrown and the user will be notified
+        :returns: True if this plugin should be activated e.g. its activated etc.
         """
-        pass
+        return True
 
     @abstractmethod
     async def process(self, journal: Journal, entry: JournalEvent) -> None:
@@ -43,6 +48,6 @@ class Processor(ABC):
 
         :param journal: The Journal instance that produced this event.
                         Provides cmdr name may be increased in the future
-        :param entry:   The parsed JournalEvent object representing the event data.
+        :param entry:   The parsed JournalEvent object representing the event schema.
         """
         pass

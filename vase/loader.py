@@ -9,6 +9,7 @@ from vase.config import config
 
 logger = logging.getLogger("vase.loader")
 
+
 def load_plugins() -> list[Processor]:
     plugins = []
 
@@ -34,6 +35,7 @@ def load_plugins() -> list[Processor]:
 
     return plugins
 
+
 def load_processor(module: ModuleType) -> Processor:
     load_func = getattr(module, "load")
     if not callable(load_func):
@@ -42,6 +44,8 @@ def load_processor(module: ModuleType) -> Processor:
     processor = load_func()
 
     if not issubclass(processor.__class__, Processor):
-        raise TypeError(f"module {module.__name__}.load() did not return a valid processor")
+        raise TypeError(
+            f"module {module.__name__}.load() did not return a valid processor"
+        )
 
     return processor

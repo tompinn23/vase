@@ -8,6 +8,7 @@ dependencies = [
     "anyio>=4.11.0",
     "colorama>=0.4.6",
     "httpx>=0.28.1",
+    "jsonschema>=4.25.1",
     "keyring>=25.6.0",
     "orjson>=3.11.3",
     "psutil>=7.1.0",

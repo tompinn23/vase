@@ -21,27 +21,34 @@ from watchfiles import awatch, Change
 
 from vase import data, api
 from vase.config import config, appname, appversion
-from vase.edmc_data import edmc_suit_shortnames, edmc_suit_symbol_localised, ship_name_map
+from vase.edmc_data import (
+    edmc_suit_shortnames,
+    edmc_suit_symbol_localised,
+    ship_name_map,
+)
 
 ship_data = read_text(data, "ships.json")
 ships = json.loads(ship_data)
 
 import logging
+
 logger = logging.getLogger(__name__)
 
 MAX_NAVROUTE_DISCREPANCY = 5  # Timestamp difference in seconds
 MAX_FCMATERIALS_DISCREPANCY = 5  # Timestamp difference in seconds
+MAX_MARKET_DISCREPANCY = 5  # Timestamp difference in seconds
+
 
 class Journal(api.Journal):
-
     _RE_LOGFILE = re.compile(r"^Journal.(\d{4}-\d{2}-\d{2}T\d{6}).\d{2}.log$")
-    _RE_CANONICALISE = re.compile(r'\$(.+)_name;')
-    _RE_CATEGORY = re.compile(r'\$MICRORESOURCE_CATEGORY_(.+);')
-    _RE_SHIP_ONFOOT = re.compile(r'^(FlightSuit|UtilitySuit_Class.|TacticalSuit_Class.|ExplorationSuit_Class.)$')
-    _RE_FC_JUMP_NAME = re.compile(r'^FC ([A-NP-Z0-9]{3})([A-NP-Z0-9]{3})$')
+    _RE_CANONICALISE = re.compile(r"\$(.+)_name;")
+    _RE_CATEGORY = re.compile(r"\$MICRORESOURCE_CATEGORY_(.+);")
+    _RE_SHIP_ONFOOT = re.compile(
+        r"^(FlightSuit|UtilitySuit_Class.|TacticalSuit_Class.|ExplorationSuit_Class.)$"
+    )
+    _RE_FC_JUMP_NAME = re.compile(r"^FC ([A-NP-Z0-9]{3})([A-NP-Z0-9]{3})$")
 
     def __init__(self, journal_dir: pathlib.Path | None = None) -> None:
-
         self.version_semantic = None
         self.game_was_running = None
         self.running_process = None
@@ -66,89 +73,87 @@ class Journal(api.Journal):
         self.session_start: int = int(time.time())
         self.status: dict[str, Any] = {}
 
-
-        self._navroute_retries_remaining = 0
-        self._last_navroute_journal_timestamp: float | None = None
-
-        self._fcmaterials_retries_remaining = 0
-        self._last_fcmaterials_journal_timestamp: float | None = None
+        self.pending_navroute: dict | None = None
+        self.pending_outfitting: dict | None = None
+        self.pending_fcmaterials: dict | None = None
+        self.pending_market: dict | None = None
+        self.pending_shipyard: dict | None = None
 
         self.carrier_ids: dict[int, str] = {}
-        self.live_galaxy_base_version = semantic_version.Version('4.0.0')
+        self.live_galaxy_base_version = semantic_version.Version("4.0.0")
 
         self.__init_state()
 
     def __init_state(self):
-        self.state: dict = {
-            'GameLanguage':       None,  # From `Fileheader
-            'GameVersion':        None,  # From `Fileheader
-            'GameBuild':          None,  # From `Fileheader
-            'Captain':            None,  # On a crew
-            'Cargo':              defaultdict(int),
-            'Credits':            None,
-            'FID':                None,  # Frontier Cmdr ID
-            'Horizons':           None,  # Does this user have Horizons?
-            'Odyssey':            False,  # Have we detected we're running under Odyssey?
-            'Loan':               None,
-            'Raw':                defaultdict(int),
-            'Manufactured':       defaultdict(int),
-            'Encoded':            defaultdict(int),
-            'Engineers':          {},
-            'Rank':               {},
-            'Reputation':         {},
-            'Statistics':         {},
-            'Role':               None,  # Crew role - None, Idle, FireCon, FighterCon
-            'Friends':            set(),  # Online friends
-            'ShipID':             None,
-            'ShipIdent':          None,
-            'ShipName':           None,
-            'ShipType':           None,
-            'HullValue':          None,
-            'ModulesValue':       None,
-            'UnladenMass':        None,
-            'CargoCapacity':      None,
-            'MaxJumpRange':       None,
-            'FuelCapacity':       None,
-            'Rebuy':              None,
-            'Modules':            None,
-            'CargoJSON':          None,  # The raw data from the last time cargo.json was read
-            'Route':              None,  # Last plotted route from Route.json file
-            'IsDocked':           False,  # Whether we think cmdr is docked
-            'OnFoot':             False,  # Whether we think you're on-foot
-            'Component':          defaultdict(int),      # Odyssey Components in Ship Locker
-            'Item':               defaultdict(int),      # Odyssey Items in Ship Locker
-            'Consumable':         defaultdict(int),      # Odyssey Consumables in Ship Locker
-            'Data':               defaultdict(int),      # Odyssey Data in Ship Locker
-            'BackPack':     {                      # Odyssey BackPack contents
-                'Component':      defaultdict(int),    # BackPack Components
-                'Consumable':     defaultdict(int),    # BackPack Consumables
-                'Item':           defaultdict(int),    # BackPack Items
-                'Data':           defaultdict(int),  # Backpack Data
+        self._state: dict = {
+            "GameLanguage": None,  # From `Fileheader
+            "GameVersion": None,  # From `Fileheader
+            "GameBuild": None,  # From `Fileheader
+            "Captain": None,  # On a crew
+            "Cargo": defaultdict(int),
+            "Credits": None,
+            "FID": None,  # Frontier Cmdr ID
+            "Horizons": None,  # Does this user have Horizons?
+            "Odyssey": False,  # Have we detected we're running under Odyssey?
+            "Loan": None,
+            "Raw": defaultdict(int),
+            "Manufactured": defaultdict(int),
+            "Encoded": defaultdict(int),
+            "Engineers": {},
+            "Rank": {},
+            "Reputation": {},
+            "Statistics": {},
+            "Role": None,  # Crew role - None, Idle, FireCon, FighterCon
+            "Friends": set(),  # Online friends
+            "ShipID": None,
+            "ShipIdent": None,
+            "ShipName": None,
+            "ShipType": None,
+            "HullValue": None,
+            "ModulesValue": None,
+            "UnladenMass": None,
+            "CargoCapacity": None,
+            "MaxJumpRange": None,
+            "FuelCapacity": None,
+            "Rebuy": None,
+            "Modules": None,
+            "CargoJSON": None,  # The raw schema from the last time cargo.json was read
+            "Route": None,  # Last plotted route from Route.json file
+            "IsDocked": False,  # Whether we think cmdr is docked
+            "OnFoot": False,  # Whether we think you're on-foot
+            "Component": defaultdict(int),  # Odyssey Components in Ship Locker
+            "Item": defaultdict(int),  # Odyssey Items in Ship Locker
+            "Consumable": defaultdict(int),  # Odyssey Consumables in Ship Locker
+            "Data": defaultdict(int),  # Odyssey Data in Ship Locker
+            "BackPack": {  # Odyssey BackPack contents
+                "Component": defaultdict(int),  # BackPack Components
+                "Consumable": defaultdict(int),  # BackPack Consumables
+                "Item": defaultdict(int),  # BackPack Items
+                "Data": defaultdict(int),  # Backpack Data
             },
-            'BackpackJSON':       None,  # Raw JSON from `Backpack.json` file, if available
-            'ShipLockerJSON':     None,  # Raw JSON from the `ShipLocker.json` file, if available
-            'SuitCurrent':        None,
-            'Suits':              {},
-            'SuitLoadoutCurrent': None,
-            'SuitLoadouts':       {},
-            'Taxi':               None,  # True whenever we are _in_ a taxi. ie, this is reset on Disembark etc.
-            'Dropship':           None,  # Best effort as to whether or not the above taxi is a dropship.
-            'StarPos':            None,  # Best effort current system's galaxy position.
-            'SystemAddress':      None,
-            'SystemName':         None,
-            'SystemPopulation':   None,
-            'Body':               None,
-            'BodyID':             None,
-            'BodyType':           None,
-            'StationName':        None,
-
-            'NavRoute':           None,
-            'Powerplay':      {
-                'Power':          None,
-                'Rank':           None,
-                'Merits':         None,
-                'Votes':          None,
-                'TimePledged':    None,
+            "BackpackJSON": None,  # Raw JSON from `Backpack.json` file, if available
+            "ShipLockerJSON": None,  # Raw JSON from the `ShipLocker.json` file, if available
+            "SuitCurrent": None,
+            "Suits": {},
+            "SuitLoadoutCurrent": None,
+            "SuitLoadouts": {},
+            "Taxi": None,  # True whenever we are _in_ a taxi. ie, this is reset on Disembark etc.
+            "Dropship": None,  # Best effort as to whether or not the above taxi is a dropship.
+            "StarPos": None,  # Best effort current system's galaxy position.
+            "SystemAddress": None,
+            "SystemName": None,
+            "SystemPopulation": None,
+            "Body": None,
+            "BodyID": None,
+            "BodyType": None,
+            "StationName": None,
+            "NavRoute": None,
+            "Powerplay": {
+                "Power": None,
+                "Rank": None,
+                "Merits": None,
+                "Votes": None,
+                "TimePledged": None,
             },
         }
 
@@ -157,7 +162,9 @@ class Journal(api.Journal):
     def cmdr(self) -> str:
         return self._cmdr
 
-
+    @property
+    def state(self) -> dict:
+        return self._state
 
     def newest_journal(self, journals_dir: pathlib.Path) -> str | None:
         try:
@@ -167,7 +174,7 @@ class Journal(api.Journal):
                 if self._RE_LOGFILE.search(x)
             ]
         except (OSError, AttributeError, TypeError) as e:
-            logger.exception(f'Failed to find latest journal in {journals_dir} {e}')
+            logger.exception(f"Failed to find latest journal in {journals_dir} {e}")
             return None
 
         if not files:
@@ -184,15 +191,15 @@ class Journal(api.Journal):
 
     async def start(self) -> AsyncGenerator[MutableMapping[str, Any], None]:
         if not isdir(self.journal_dir):
-            logger.error(f'{self.journal_dir} is not a directory')
+            logger.error(f"{self.journal_dir} is not a directory")
             return
 
         self.logfile = self.newest_journal(self.journal_dir)
 
-        logger.debug(f'Started journal at {self.logfile}')
+        logger.debug(f"Started journal at {self.logfile}")
         log_pos = -1
         if self.logfile:
-            loghandle: AsyncFile | None = await anyio.open_file(self.logfile, 'rb', 0)
+            loghandle: AsyncFile | None = await anyio.open_file(self.logfile, "rb", 0)
             self.replay = True
             async for line in loghandle:
                 try:
@@ -200,23 +207,25 @@ class Journal(api.Journal):
                         logger.debug('"Location" event in the past')
                     await self.parse_entry(line)
                 except Exception as e:
-                    logger.debug(f'Invalid journal entry:\n{line!r}\n', exc_info=e)
-                navroute = await self._parse_navroute_file()
+                    logger.debug(f"Invalid journal entry:\n{line!r}\n", exc_info=e)
+                navroute = await self.__read_navroute()
                 if navroute is not None:
-                    self.state['NavRoute'] = navroute
+                    self._state["NavRoute"] = navroute
 
                 self.replay = False
                 log_pos = await loghandle.tell()
         else:
             loghandle = None
 
-        logger.debug(f"End of latest journal")
+        logger.debug("End of latest journal")
 
         self.game_was_running = self.game_running()
 
         if self.live:
             if self.game_was_running:
-                logger.info("Game is/was running, synthesizing StartUp event for plugins")
+                logger.info(
+                    "Game is/was running, synthesizing StartUp event for plugins"
+                )
                 entry = self.synthesize_startup_event()
                 yield entry
             else:
@@ -227,48 +236,73 @@ class Journal(api.Journal):
             for event, file in events:
                 name = pathlib.Path(file).name
                 if event == Change.added and self._RE_LOGFILE.search(name):
-                    if file != self.logfile: # sanity check
+                    if file != self.logfile:  # sanity check
                         logger.info(f"New journal file: {file} was {self.logfile}")
                         self.logfile = file
                         if loghandle:
                             await loghandle.aclose()
-                        loghandle = await anyio.open_file(self.logfile, 'rb', 0)
+                        loghandle = await anyio.open_file(self.logfile, "rb", 0)
                         log_pos = 0
                 if event == Change.modified and file == self.logfile:
                     await loghandle.seek(log_pos, SEEK_SET)
                     async for line in loghandle:
                         if b'"event":"Continue"' in line:
-                            logger.debug('Found a Continue event, its being added to the list, '
-                                         'we will finish this file up and then continue with the next')
+                            logger.debug(
+                                "Found a Continue event, its being added to the list, "
+                                "we will finish this file up and then continue with the next"
+                            )
                         try:
                             yield await self.parse_entry(line)
                         except Exception as e:
-                            logger.debug(f'Invalid journal entry:\n{line!r}\n', exc_info=e)
+                            logger.debug(
+                                f"Invalid journal entry:\n{line!r}\n", exc_info=e
+                            )
                     log_pos = await loghandle.tell()
-                if event in (Change.modified, Change.added) and name == 'Status.json':
+                if event in (Change.modified, Change.added) and name == "Status.json":
                     await self.process_status()
                     yield self.status
+                if event in (Change.added, Change.modified) and name == "Outfitting.json":
+                    entry = await self.__read_outfitting()
+                    if entry is not None:
+                        yield entry
+                if event in (Change.added, Change.modified) and name == "NavRoute.json":
+                    entry = await self.__read_navroute()
+                    if entry is not None:
+                        yield entry
+                if event in (Change.added, Change.modified) and name == "Market.json":
+                    entry = await self.__read_market()
+                    if entry is not None:
+                        yield entry
+                if (
+                    event in (Change.added, Change.modified)
+                    and name == "FCMaterials.json"
+                ):
+                    entry = await self.__read_fcmaterials()
+                    if entry is not None:
+                        yield entry
+                if event in (Change.added, Change.modified) and name == "Shipyard.json":
+                    entry = await self.__read_shipyard()
+                    if entry is not None:
+                        yield entry
         if self.game_was_running:
             if not self.game_running():
-                logger.info('Detected exit from game, synthesising ShutDown event')
-                timestamp = strftime('%Y-%m-%dT%H:%M:%SZ', gmtime())
+                logger.info("Detected exit from game, synthesising ShutDown event")
+                timestamp = strftime("%Y-%m-%dT%H:%M:%SZ", gmtime())
                 yield {"timestamp": timestamp, "event": "ShutDown"}
 
     async def process_status(self):
         try:
-            async with await anyio.open_file(self.journal_dir / 'Status.json') as f:
+            async with await anyio.open_file(self.journal_dir / "Status.json") as f:
                 data = await f.read()
                 if data:
                     entry = json.loads(data)
-                    entry_timestamp = timegm(time.strptime(entry['timestamp'], '%Y-%m-%dT%H:%M:%SZ'))
+                    entry_timestamp = timegm(
+                        time.strptime(entry["timestamp"], "%Y-%m-%dT%H:%M:%SZ")
+                    )
                     if entry_timestamp >= self.session_start and self.status != entry:
                         self.status = entry
         except Exception:
             logger.exception("Processing Status.json")
-
-
-
-
 
     async def parse_entry(self, line: bytes) -> MutableMapping[str, Any]:  # noqa: C901, CCR001
         """
@@ -283,32 +317,30 @@ class Journal(api.Journal):
         """
         # TODO(A_D): a bunch of these can be simplified to use if itertools.product and filters
         if line is None:
-            return {'event': None}  # Fake startup event
+            return {"event": None}  # Fake startup event
 
         try:
             # Preserve property order because why not?
             entry: MutableMapping[str, Any] = json.loads(line)
-            if 'timestamp' not in entry:
+            if "timestamp" not in entry:
                 raise KeyError("Timestamp does not exist in the entry")
 
-            await self.__navroute_retry()
-
-            event_type = entry['event'].lower()
-            if event_type == 'fileheader':
+            event_type = entry["event"].lower()
+            if event_type == "fileheader":
                 self.live = False
 
                 self._cmdr = None
                 self.mode = None
                 self.group = None
-                self.state['SystemAddress'] = None
-                self.state['SystemName'] = None
-                self.state['SystemPopulation'] = None
-                self.state['StarPos'] = None
-                self.state['Body'] = None
-                self.state['BodyID'] = None
-                self.state['StationName'] = None
-                self.state['MarketID'] = None
-                self.state['StationType'] = None
+                self._state["SystemAddress"] = None
+                self._state["SystemName"] = None
+                self._state["SystemPopulation"] = None
+                self._state["StarPos"] = None
+                self._state["Body"] = None
+                self._state["BodyID"] = None
+                self._state["StationName"] = None
+                self._state["MarketID"] = None
+                self._state["StationType"] = None
                 self.stationservices = None
                 self.started = None
                 self.__init_state()
@@ -316,215 +348,238 @@ class Journal(api.Journal):
                 # Do this AFTER __init_state() lest our nice new state entries be None
                 self.populate_version_info(entry)
 
-            elif event_type == 'commander':
+            elif event_type == "commander":
                 self.live = True  # First event in 3.0
-                self._cmdr = entry['Name']
-                self.state['FID'] = entry['FID']
-                logger.debug('"Commander" event, {self.cmdr=}, {self.state["FID"]=}')
+                self._cmdr = entry["Name"]
+                self._state["FID"] = entry["FID"]
+                logger.debug('"Commander" event, {self.cmdr=}, {self._state["FID"]=}')
 
-            elif event_type == 'loadgame':
-                # Odyssey Release Update 5 -- This contains data that doesn't match the format used in FileHeader above
+            elif event_type == "loadgame":
+                # Odyssey Release Update 5 -- This contains schema that doesn't match the format used in FileHeader above
                 self.populate_version_info(entry, suppress=True)
 
                 # alpha4
                 # Odyssey: bool
-                self._cmdr = entry['Commander']
+                self._cmdr = entry["Commander"]
                 # 'Open', 'Solo', 'Group', or None for CQC (and Training - but no LoadGame event)
-                if not entry.get('Ship') and not entry.get('GameMode') or entry.get('GameMode', '').lower() == 'cqc':
-                    logger.debug(f'loadgame to cqc: {entry}')
-                    self.mode = 'CQC'
+                if (
+                    not entry.get("Ship")
+                    and not entry.get("GameMode")
+                    or entry.get("GameMode", "").lower() == "cqc"
+                ):
+                    logger.debug(f"loadgame to cqc: {entry}")
+                    self.mode = "CQC"
 
                 else:
-                    self.mode = entry.get('GameMode')
+                    self.mode = entry.get("GameMode")
 
-                self.group = entry.get('Group')
-                self.state['SystemAddress'] = None
-                self.state['SystemName'] = None
-                self.state['SystemPopulation'] = None
-                self.state['StarPos'] = None
-                self.state['Body'] = None
-                self.state['BodyID'] = None
-                self.state['BodyType'] = None
-                self.state['StationName'] = None
-                self.state['MarketID'] = None
-                self.state['StationType'] = None
+                self.group = entry.get("Group")
+                self._state["SystemAddress"] = None
+                self._state["SystemName"] = None
+                self._state["SystemPopulation"] = None
+                self._state["StarPos"] = None
+                self._state["Body"] = None
+                self._state["BodyID"] = None
+                self._state["BodyType"] = None
+                self._state["StationName"] = None
+                self._state["MarketID"] = None
+                self._state["StationType"] = None
                 self.stationservices = None
-                self.started = timegm(strptime(entry['timestamp'], '%Y-%m-%dT%H:%M:%SZ'))
+                self.started = timegm(
+                    strptime(entry["timestamp"], "%Y-%m-%dT%H:%M:%SZ")
+                )
                 # Don't set Ship, ShipID etc since this will reflect Fighter or SRV if starting in those
-                self.state.update({
-                    'Captain':              None,
-                    'Credits':              entry['Credits'],
-                    'FID':                  entry.get('FID'),   # From 3.3
-                    'Horizons':             entry['Horizons'],  # From 3.0
-                    'Odyssey':              entry.get('Odyssey', False),  # From 4.0 Odyssey
-                    'Loan':                 entry['Loan'],
-                    # For Odyssey, by 4.0.0.100, and at least from Horizons 3.8.0.201 the order of events changed
-                    # to LoadGame being after some 'status' events.
-                    # 'Engineers':          {},  # 'EngineerProgress' event now before 'LoadGame'
-                    # 'Rank':               {},  # 'Rank'/'Progress' events now before 'LoadGame'
-                    # 'Reputation':         {},  # 'Reputation' event now before 'LoadGame'
-                    'Statistics':           {},  # Still after 'LoadGame' in 4.0.0.903
-                    'Role':                 None,
-                    'Taxi':                 None,
-                    'Dropship':             None,
-                })
-                if entry.get('Ship') is not None and self._RE_SHIP_ONFOOT.search(entry['Ship']):
-                    self.state['OnFoot'] = True
+                self._state.update(
+                    {
+                        "Captain": None,
+                        "Credits": entry["Credits"],
+                        "FID": entry.get("FID"),  # From 3.3
+                        "Horizons": entry["Horizons"],  # From 3.0
+                        "Odyssey": entry.get("Odyssey", False),  # From 4.0 Odyssey
+                        "Loan": entry["Loan"],
+                        # For Odyssey, by 4.0.0.100, and at least from Horizons 3.8.0.201 the order of events changed
+                        # to LoadGame being after some 'status' events.
+                        # 'Engineers':          {},  # 'EngineerProgress' event now before 'LoadGame'
+                        # 'Rank':               {},  # 'Rank'/'Progress' events now before 'LoadGame'
+                        # 'Reputation':         {},  # 'Reputation' event now before 'LoadGame'
+                        "Statistics": {},  # Still after 'LoadGame' in 4.0.0.903
+                        "Role": None,
+                        "Taxi": None,
+                        "Dropship": None,
+                    }
+                )
+                if entry.get("Ship") is not None and self._RE_SHIP_ONFOOT.search(
+                    entry["Ship"]
+                ):
+                    self._state["OnFoot"] = True
 
-                logger.debug(f'"LoadGame" event, {self._cmdr=}, {self.state["FID"]=}')
+                logger.debug(f'"LoadGame" event, {self._cmdr=}, {self._state["FID"]=}')
 
-            elif event_type == 'newcommander':
-                self._cmdr = entry['Name']
+            elif event_type == "newcommander":
+                self._cmdr = entry["Name"]
                 self.group = None
 
-            elif event_type == 'setusershipname':
-                self.state['ShipID'] = entry['ShipID']
-                if 'UserShipId' in entry:  # Only present when changing the ship's ident
-                    self.state['ShipIdent'] = entry['UserShipId']
+            elif event_type == "setusershipname":
+                self._state["ShipID"] = entry["ShipID"]
+                if "UserShipId" in entry:  # Only present when changing the ship's ident
+                    self._state["ShipIdent"] = entry["UserShipId"]
 
-                self.state['ShipName'] = entry.get('UserShipName')
-                self.state['ShipType'] = self.canonicalise(entry['Ship'])
+                self._state["ShipName"] = entry.get("UserShipName")
+                self._state["ShipType"] = self.canonicalise(entry["Ship"])
 
-            elif event_type == 'shipyardbuy':
-                self.state['ShipID'] = None
-                self.state['ShipIdent'] = None
-                self.state['ShipName'] = None
-                self.state['ShipType'] = self.canonicalise(entry['ShipType'])
-                self.state['HullValue'] = None
-                self.state['ModulesValue'] = None
-                self.state['Rebuy'] = None
-                self.state['Modules'] = None
+            elif event_type == "shipyardbuy":
+                self._state["ShipID"] = None
+                self._state["ShipIdent"] = None
+                self._state["ShipName"] = None
+                self._state["ShipType"] = self.canonicalise(entry["ShipType"])
+                self._state["HullValue"] = None
+                self._state["ModulesValue"] = None
+                self._state["Rebuy"] = None
+                self._state["Modules"] = None
 
-                self.state['Credits'] -= entry.get('ShipPrice', 0)
+                self._state["Credits"] -= entry.get("ShipPrice", 0)
 
-            elif event_type == 'shipyardswap':
-                self.state['ShipID'] = entry['ShipID']
-                self.state['ShipIdent'] = None
-                self.state['ShipName'] = None
-                self.state['ShipType'] = self.canonicalise(entry['ShipType'])
-                self.state['HullValue'] = None
-                self.state['ModulesValue'] = None
-                self.state['Rebuy'] = None
-                self.state['Modules'] = None
+            elif event_type == "shipyardswap":
+                self._state["ShipID"] = entry["ShipID"]
+                self._state["ShipIdent"] = None
+                self._state["ShipName"] = None
+                self._state["ShipType"] = self.canonicalise(entry["ShipType"])
+                self._state["HullValue"] = None
+                self._state["ModulesValue"] = None
+                self._state["Rebuy"] = None
+                self._state["Modules"] = None
 
-            elif event_type == 'carrierstats':
-                self.carrier_ids[entry['CarrierID']] = entry['Callsign']
+            elif event_type == "carrierstats":
+                self.carrier_ids[entry["CarrierID"]] = entry["Callsign"]
 
-            elif event_type == 'carrierjumprequest':
-                callsign = self.carrier_ids[entry['CarrierID']]
+            elif event_type == "carrierjumprequest":
+                callsign = self.carrier_ids[entry["CarrierID"]]
                 if callsign is not None:
-                    entry['Callsign'] = callsign
-                    entry['VaseEnhanced'] = True
+                    entry["Callsign"] = callsign
+                    entry["VaseEnhanced"] = True
 
-            elif event_type == 'carrierjumpcancelled':
-                callsign = self.carrier_ids[entry['CarrierID']]
+            elif event_type == "carrierjumpcancelled":
+                callsign = self.carrier_ids[entry["CarrierID"]]
                 if callsign is not None:
-                    entry['Callsign'] = callsign
-                    entry['VaseEnhanced'] = True
+                    entry["Callsign"] = callsign
+                    entry["VaseEnhanced"] = True
 
-            elif event_type == 'carrierjump':
-                name = entry['StationName']
+            elif event_type == "carrierjump":
+                name = entry["StationName"]
                 match = self._RE_FC_JUMP_NAME.match(name)
                 if match is not None:
-                    entry['Callsign'] = f"{match.group(1)}-{match.group(2)}"
-                    entry['VaseEnhanced'] = True
+                    entry["Callsign"] = f"{match.group(1)}-{match.group(2)}"
+                    entry["VaseEnhanced"] = True
 
             elif (
-                event_type == 'loadout' and
-                'fighter' not in self.canonicalise(entry['Ship']) and
-                'buggy' not in self.canonicalise(entry['Ship'])
+                event_type == "loadout"
+                and "fighter" not in self.canonicalise(entry["Ship"])
+                and "buggy" not in self.canonicalise(entry["Ship"])
             ):
-                self.state['ShipID'] = entry['ShipID']
-                self.state['ShipIdent'] = entry['ShipIdent']
+                self._state["ShipID"] = entry["ShipID"]
+                self._state["ShipIdent"] = entry["ShipIdent"]
 
                 # Newly purchased ships can show a ShipName of "" initially,
                 # and " " after a game restart/relog.
                 # Players *can* also purposefully set " " as the name, but anyone
                 # doing that gets to live with EDMC showing ShipType instead.
-                if entry['ShipName'] and entry['ShipName'] not in ('', ' '):
-                    self.state['ShipName'] = entry['ShipName']
+                if entry["ShipName"] and entry["ShipName"] not in ("", " "):
+                    self._state["ShipName"] = entry["ShipName"]
 
-                self.state['ShipType'] = self.canonicalise(entry['Ship'])
-                self.state['HullValue'] = entry.get('HullValue')  # not present on exiting Outfitting
-                self.state['ModulesValue'] = entry.get('ModulesValue')  # not present on exiting Outfitting
-                self.state['UnladenMass'] = entry.get('UnladenMass')
-                self.state['CargoCapacity'] = entry.get('CargoCapacity')
-                self.state['MaxJumpRange'] = entry.get('MaxJumpRange')
-                self.state["FuelCapacity"] = {name: entry.get("FuelCapacity", {}).get(name) for name in
-                                              ("Main", "Reserve")}
-                self.state['Rebuy'] = entry.get('Rebuy')
+                self._state["ShipType"] = self.canonicalise(entry["Ship"])
+                self._state["HullValue"] = entry.get(
+                    "HullValue"
+                )  # not present on exiting Outfitting
+                self._state["ModulesValue"] = entry.get(
+                    "ModulesValue"
+                )  # not present on exiting Outfitting
+                self._state["UnladenMass"] = entry.get("UnladenMass")
+                self._state["CargoCapacity"] = entry.get("CargoCapacity")
+                self._state["MaxJumpRange"] = entry.get("MaxJumpRange")
+                self._state["FuelCapacity"] = {
+                    name: entry.get("FuelCapacity", {}).get(name)
+                    for name in ("Main", "Reserve")
+                }
+                self._state["Rebuy"] = entry.get("Rebuy")
                 # Remove spurious differences between initial Loadout event and subsequent
-                self.state['Modules'] = {}
-                for module in entry['Modules']:
+                self._state["Modules"] = {}
+                for module in entry["Modules"]:
                     module = dict(module)
-                    module['Item'] = self.canonicalise(module['Item'])
-                    if ('Hardpoint' in module['Slot'] and
-                        not module['Slot'].startswith('TinyHardpoint') and
-                            module.get('AmmoInClip') == module.get('AmmoInHopper') == 1):  # lasers
-                        module.pop('AmmoInClip')
-                        module.pop('AmmoInHopper')
+                    module["Item"] = self.canonicalise(module["Item"])
+                    if (
+                        "Hardpoint" in module["Slot"]
+                        and not module["Slot"].startswith("TinyHardpoint")
+                        and module.get("AmmoInClip") == module.get("AmmoInHopper") == 1
+                    ):  # lasers
+                        module.pop("AmmoInClip")
+                        module.pop("AmmoInHopper")
 
-                    self.state['Modules'][module['Slot']] = module
+                    self._state["Modules"][module["Slot"]] = module
                 # SLEF
                 initial_dict: dict[str, dict[str, Any]] = {
                     "header": {"appName": appname, "appVersion": str(appversion())}
                 }
                 data_dict = {}
-                for module in entry['Modules']:
-                    if module.get('Slot') == 'FuelTank':
-                        cap = module['Item'].split('size')
-                        cap = cap[1].split('_')
+                for module in entry["Modules"]:
+                    if module.get("Slot") == "FuelTank":
+                        cap = module["Item"].split("size")
+                        cap = cap[1].split("_")
                         cap = 2 ** int(cap[0])
                         ship = ship_name_map[entry["Ship"]]
-                        fuel = {'Main': cap, 'Reserve': ships[ship]['reserveFuelCapacity']}
+                        fuel = {
+                            "Main": cap,
+                            "Reserve": ships[ship]["reserveFuelCapacity"],
+                        }
                         data_dict.update({"FuelCapacity": fuel})
-                data_dict.update({
-                    'Ship': entry["Ship"],
-                    'ShipName': entry['ShipName'],
-                    'ShipIdent': entry['ShipIdent'],
-                    'HullValue': entry.get('HullValue'),  # type: ignore
-                    'ModulesValue': entry.get('ModulesValue'),  # type: ignore
-                    'Rebuy': entry['Rebuy'],
-                    'MaxJumpRange': entry['MaxJumpRange'],
-                    'UnladenMass': entry['UnladenMass'],
-                    'CargoCapacity': entry['CargoCapacity'],
-                    'Modules': entry['Modules'],
-                })
-                initial_dict.update({'data': data_dict})
+                data_dict.update(
+                    {
+                        "Ship": entry["Ship"],
+                        "ShipName": entry["ShipName"],
+                        "ShipIdent": entry["ShipIdent"],
+                        "HullValue": entry.get("HullValue"),  # type: ignore
+                        "ModulesValue": entry.get("ModulesValue"),  # type: ignore
+                        "Rebuy": entry["Rebuy"],
+                        "MaxJumpRange": entry["MaxJumpRange"],
+                        "UnladenMass": entry["UnladenMass"],
+                        "CargoCapacity": entry["CargoCapacity"],
+                        "Modules": entry["Modules"],
+                    }
+                )
+                initial_dict.update({"schema": data_dict})
                 output = json.dumps(initial_dict, indent=4)
                 self.slef = str(f"[{output}]")
 
-            elif event_type == 'modulebuy':
-                self.state['Modules'][entry['Slot']] = {
-                    'Slot':     entry['Slot'],
-                    'Item':     self.canonicalise(entry['BuyItem']),
-                    'On':       True,
-                    'Priority': 1,
-                    'Health':   1.0,
-                    'Value':    entry['BuyPrice'],
+            elif event_type == "modulebuy":
+                self._state["Modules"][entry["Slot"]] = {
+                    "Slot": entry["Slot"],
+                    "Item": self.canonicalise(entry["BuyItem"]),
+                    "On": True,
+                    "Priority": 1,
+                    "Health": 1.0,
+                    "Value": entry["BuyPrice"],
                 }
 
-                self.state['Credits'] -= entry.get('BuyPrice', 0)
+                self._state["Credits"] -= entry.get("BuyPrice", 0)
 
-            elif event_type == 'moduleretrieve':
-                self.state['Credits'] -= entry.get('Cost', 0)
+            elif event_type == "moduleretrieve":
+                self._state["Credits"] -= entry.get("Cost", 0)
 
-            elif event_type == 'modulesell':
-                self.state['Modules'].pop(entry['Slot'], None)
-                self.state['Credits'] += entry.get('SellPrice', 0)
+            elif event_type == "modulesell":
+                self._state["Modules"].pop(entry["Slot"], None)
+                self._state["Credits"] += entry.get("SellPrice", 0)
 
-            elif event_type == 'modulesellremote':
-                self.state['Credits'] += entry.get('SellPrice', 0)
+            elif event_type == "modulesellremote":
+                self._state["Credits"] += entry.get("SellPrice", 0)
 
-            elif event_type == 'modulestore':
-                self.state['Modules'].pop(entry['Slot'], None)
-                self.state['Credits'] -= entry.get('Cost', 0)
+            elif event_type == "modulestore":
+                self._state["Modules"].pop(entry["Slot"], None)
+                self._state["Credits"] -= entry.get("Cost", 0)
 
-            elif event_type == 'moduleswap':
-                to_item = self.state['Modules'].get(entry['ToSlot'])
-                to_slot = entry['ToSlot']
-                from_slot = entry['FromSlot']
-                modules = self.state['Modules']
+            elif event_type == "moduleswap":
+                to_item = self._state["Modules"].get(entry["ToSlot"])
+                to_slot = entry["ToSlot"]
+                from_slot = entry["FromSlot"]
+                modules = self._state["Modules"]
                 modules[to_slot] = modules[from_slot]
                 if to_item:
                     modules[from_slot] = to_item
@@ -532,14 +587,14 @@ class Journal(api.Journal):
                 else:
                     modules.pop(from_slot, None)
 
-            elif event_type == 'undocked':
-                self.state['StationName'] = None
-                self.state['MarketID'] = None
-                self.state['StationType'] = None
+            elif event_type == "undocked":
+                self._state["StationName"] = None
+                self._state["MarketID"] = None
+                self._state["StationType"] = None
                 self.stationservices = None
-                self.state['IsDocked'] = False
+                self._state["IsDocked"] = False
 
-            elif event_type == 'embark':
+            elif event_type == "embark":
                 # This event is logged when a player (on foot) gets into a ship or SRV
                 # Parameters:
                 #     • SRV: true if getting into SRV, false if getting into a ship
@@ -555,20 +610,20 @@ class Journal(api.Journal):
                 #     • StationName (if at a station)
                 #     • StationType
                 #     • MarketID
-                self.state['StationName'] = None
-                self.state['MarketID'] = None
-                if entry.get('OnStation'):
-                    self.state['StationName'] = entry.get('StationName', '')
-                    self.state['MarketID'] = entry.get('MarketID', '')
+                self._state["StationName"] = None
+                self._state["MarketID"] = None
+                if entry.get("OnStation"):
+                    self._state["StationName"] = entry.get("StationName", "")
+                    self._state["MarketID"] = entry.get("MarketID", "")
 
-                self.state['OnFoot'] = False
-                self.state['Taxi'] = entry['Taxi']
+                self._state["OnFoot"] = False
+                self._state["Taxi"] = entry["Taxi"]
 
                 # We can't now have anything in the BackPack, it's all in the
                 # ShipLocker.
                 self.backpack_set_empty()
 
-            elif event_type == 'disembark':
+            elif event_type == "disembark":
                 # This event is logged when the player steps out of a ship or SRV
                 #
                 # Parameters:
@@ -586,26 +641,30 @@ class Journal(api.Journal):
                 #     • StationType
                 #     • MarketID
 
-                if entry.get('OnStation', False):
-                    self.state['StationName'] = entry.get('StationName', '')
+                if entry.get("OnStation", False):
+                    self._state["StationName"] = entry.get("StationName", "")
 
                 else:
-                    self.state['StationName'] = None
+                    self._state["StationName"] = None
 
-                self.state['OnFoot'] = True
-                if self.state['Taxi'] is not None and self.state['Taxi'] != entry.get('Taxi', False):
-                    logger.warning('Disembarked from a taxi but we didn\'t know we were in a taxi?')
+                self._state["OnFoot"] = True
+                if self._state["Taxi"] is not None and self._state["Taxi"] != entry.get(
+                    "Taxi", False
+                ):
+                    logger.warning(
+                        "Disembarked from a taxi but we didn't know we were in a taxi?"
+                    )
 
-                self.state['Taxi'] = False
-                self.state['Dropship'] = False
+                self._state["Taxi"] = False
+                self._state["Dropship"] = False
 
-            elif event_type == 'dropshipdeploy':
+            elif event_type == "dropshipdeploy":
                 # We're definitely on-foot now
-                self.state['OnFoot'] = True
-                self.state['Taxi'] = False
-                self.state['Dropship'] = False
+                self._state["OnFoot"] = True
+                self._state["Taxi"] = False
+                self._state["Dropship"] = False
 
-            elif event_type == 'supercruiseexit':
+            elif event_type == "supercruiseexit":
                 # For any orbital station we have no way of determining the body
                 # it orbits:
                 #
@@ -613,25 +672,27 @@ class Journal(api.Journal):
                 #   On-foot Status.json lists the station itself as Body.
                 #   Location for stations (on-foot or in-ship) has station as Body.
                 #   SupercruiseExit (own ship or taxi) lists the station as the Body.
-                if entry['BodyType'] == 'Station':
-                    self.state['Body'] = None
-                    self.state['BodyID'] = None
+                if entry["BodyType"] == "Station":
+                    self._state["Body"] = None
+                    self._state["BodyID"] = None
 
-            elif event_type == 'docked':
+            elif event_type == "docked":
                 ###############################################################
                 # Track: Station
                 ###############################################################
-                self.state['IsDocked'] = True
-                self.state['StationName'] = entry.get('StationName')  # It may be None
-                self.state['MarketID'] = entry.get('MarketID')  # It may be None
-                self.state['StationType'] = entry.get('StationType')  # It may be None
-                self.stationservices = entry.get('StationServices')  # None under E:D < 2.4
+                self._state["IsDocked"] = True
+                self._state["StationName"] = entry.get("StationName")  # It may be None
+                self._state["MarketID"] = entry.get("MarketID")  # It may be None
+                self._state["StationType"] = entry.get("StationType")  # It may be None
+                self.stationservices = entry.get(
+                    "StationServices"
+                )  # None under E:D < 2.4
 
-                # No need to set self.state['Taxi'] or Dropship here, if it's
+                # No need to set self._state['Taxi'] or Dropship here, if it's
                 # those, the next event is a Disembark anyway
                 ###############################################################
 
-            elif event_type in ('location', 'fsdjump', 'carrierjump'):
+            elif event_type in ("location", "fsdjump", "carrierjump"):
                 """
                 Notes on tracking of a player's location.
 
@@ -675,198 +736,217 @@ class Journal(api.Journal):
                   land on it again **without a fresh 'ApproachBody'** event.
 
                   The only way to check for this is to utilise the Body (name)
-                  present in `Status.json` data, as this *will* correctly
+                  present in `Status.json` schema, as this *will* correctly
                   reflect the second Body.
                 """
                 ###############################################################
                 # Track: Body
                 ###############################################################
-                if event_type in ('location', 'carrierjump'):
+                if event_type in ("location", "carrierjump"):
                     # We're not guaranteeing this is a planet, rather than a
                     # station.
-                    self.state['Body'] = entry.get('Body')
-                    self.state['BodyID'] = entry.get('BodyID')
-                    self.state['BodyType'] = entry.get('BodyType')
+                    self._state["Body"] = entry.get("Body")
+                    self._state["BodyID"] = entry.get("BodyID")
+                    self._state["BodyType"] = entry.get("BodyType")
 
-                elif event_type == 'fsdjump':
-                    self.state['Body'] = None
-                    self.state['BodyID'] = None
-                    self.state['BodyType'] = None
+                elif event_type == "fsdjump":
+                    self._state["Body"] = None
+                    self._state["BodyID"] = None
+                    self._state["BodyType"] = None
                 ###############################################################
 
                 ###############################################################
                 # Track: IsDocked
                 ###############################################################
-                if event_type == 'location':
+                if event_type == "location":
                     logger.debug('"Location" event')
-                    self.state['IsDocked'] = entry.get('Docked', False)
+                    self._state["IsDocked"] = entry.get("Docked", False)
                 ###############################################################
 
                 ###############################################################
                 # Track: Current System
                 ###############################################################
-                if 'StarPos' in entry:
+                if "StarPos" in entry:
                     # Plugins need this as well, so copy in state
-                    self.state['StarPos'] = tuple(entry['StarPos'])
+                    self._state["StarPos"] = tuple(entry["StarPos"])
 
                 else:
-                    logger.warning(f"'{event_type}' event without 'StarPos' !!!:\n{entry}\n")
+                    logger.warning(
+                        f"'{event_type}' event without 'StarPos' !!!:\n{entry}\n"
+                    )
 
-                if 'SystemAddress' not in entry:
-                    logger.warning(f"{event_type} event without SystemAddress !!!:\n{entry}\n")
+                if "SystemAddress" not in entry:
+                    logger.warning(
+                        f"{event_type} event without SystemAddress !!!:\n{entry}\n"
+                    )
 
                 # But we'll still *use* the value, because if a 'location' event doesn't
                 # have this we've still moved and now don't know where and MUST NOT
                 # continue to use any old value.
                 # Yes, explicitly state `None` here, so it's crystal clear.
-                self.state['SystemAddress'] = entry.get('SystemAddress', None)
+                self._state["SystemAddress"] = entry.get("SystemAddress", None)
 
-                self.state['SystemPopulation'] = entry.get('Population')
+                self._state["SystemPopulation"] = entry.get("Population")
 
-                if entry['StarSystem'] == 'ProvingGround':
-                    self.state['SystemName'] = 'CQC'
+                if entry["StarSystem"] == "ProvingGround":
+                    self._state["SystemName"] = "CQC"
 
                 else:
-                    self.state['SystemName'] = entry['StarSystem']
+                    self._state["SystemName"] = entry["StarSystem"]
                 ###############################################################
 
                 ###############################################################
                 # Track: Current station, if applicable
                 ###############################################################
-                if event_type == 'fsdjump':
-                    self.state['StationName'] = None
-                    self.state['MarketID'] = None
-                    self.state['StationType'] = None
+                if event_type == "fsdjump":
+                    self._state["StationName"] = None
+                    self._state["MarketID"] = None
+                    self._state["StationType"] = None
                     self.stationservices = None
 
                 else:
-                    self.state['StationName'] = entry.get('StationName')  # It may be None
+                    self._state["StationName"] = entry.get(
+                        "StationName"
+                    )  # It may be None
                     # If on foot in-station 'Docked' is false, but we have a
                     # 'BodyType' of 'Station', and the 'Body' is the station name
                     # NB: No MarketID
-                    if entry.get('BodyType') and entry['BodyType'] == 'Station':
-                        self.state['StationName'] = entry.get('Body')
+                    if entry.get("BodyType") and entry["BodyType"] == "Station":
+                        self._state["StationName"] = entry.get("Body")
 
-                    self.state['MarketID'] = entry.get('MarketID')  # May be None
-                    self.state['StationType'] = entry.get('StationType')  # May be None
-                    self.stationservices = entry.get('StationServices')  # None in Odyssey for on-foot 'Location'
+                    self._state["MarketID"] = entry.get("MarketID")  # May be None
+                    self._state["StationType"] = entry.get("StationType")  # May be None
+                    self.stationservices = entry.get(
+                        "StationServices"
+                    )  # None in Odyssey for on-foot 'Location'
                 ###############################################################
 
                 ###############################################################
                 # Track: Whether in a Taxi/Dropship
                 ###############################################################
-                self.state['Taxi'] = entry.get('Taxi', None)
-                if not self.state['Taxi']:
-                    self.state['Dropship'] = None
+                self._state["Taxi"] = entry.get("Taxi", None)
+                if not self._state["Taxi"]:
+                    self._state["Dropship"] = None
                 ###############################################################
 
-            elif event_type == 'approachbody':
-                self.state['Body'] = entry['Body']
-                self.state['BodyID'] = entry.get('BodyID')
+            elif event_type == "approachbody":
+                self._state["Body"] = entry["Body"]
+                self._state["BodyID"] = entry.get("BodyID")
                 # This isn't in the event, but Journal doc for ApproachBody says:
                 #   when in Supercruise, and distance from planet drops to within the 'Orbital Cruise' zone
-                # Used in plugins/eddn.py for setting entry Body/BodyType
+                # Used in plugins/processor.py for setting entry Body/BodyType
                 # on 'docked' events when Planetary.
-                self.state['BodyType'] = 'Planet'
+                self._state["BodyType"] = "Planet"
 
-            elif event_type == 'leavebody':
+            elif event_type == "leavebody":
                 # Triggered when ship goes above Orbital Cruise altitude, such
                 # that a new 'ApproachBody' would get triggered if the ship
                 # went back down.
-                self.state['Body'] = None
-                self.state['BodyID'] = None
-                self.state['BodyType'] = None
+                self._state["Body"] = None
+                self._state["BodyID"] = None
+                self._state["BodyType"] = None
 
-            elif event_type == 'supercruiseentry':
+            elif event_type == "supercruiseentry":
                 # We only clear Body state if the Type is Station.  This is
                 # because we won't get a fresh ApproachBody if we don't leave
                 # Orbital Cruise but land again.
-                if self.state['BodyType'] == 'Station':
-                    self.state['Body'] = None
-                    self.state['BodyID'] = None
-                    self.state['BodyType'] = None
+                if self._state["BodyType"] == "Station":
+                    self._state["Body"] = None
+                    self._state["BodyID"] = None
+                    self._state["BodyType"] = None
 
                 ###############################################################
                 # Track: Current station, if applicable
                 ###############################################################
-                self.state['StationName'] = None
-                self.state['MarketID'] = None
-                self.state['StationType'] = None
+                self._state["StationName"] = None
+                self._state["MarketID"] = None
+                self._state["StationType"] = None
                 self.stationservices = None
                 ###############################################################
 
-            elif event_type == 'music':
-                if entry['MusicTrack'] == 'MainMenu':
+            elif event_type == "music":
+                if entry["MusicTrack"] == "MainMenu":
                     # We'll get new Body state when the player logs back into
                     # the game.
-                    self.state['Body'] = None
-                    self.state['BodyID'] = None
-                    self.state['BodyType'] = None
+                    self._state["Body"] = None
+                    self._state["BodyID"] = None
+                    self._state["BodyType"] = None
 
-            elif event_type in ('rank', 'promotion'):
+            elif event_type in ("rank", "promotion"):
                 payload = dict(entry)
-                payload.pop('event')
-                payload.pop('timestamp')
+                payload.pop("event")
+                payload.pop("timestamp")
 
-                self.state['Rank'].update({k: (v, 0) for k, v in payload.items()})
+                self._state["Rank"].update({k: (v, 0) for k, v in payload.items()})
 
-            elif event_type == 'progress':
-                rank = self.state['Rank']
+            elif event_type == "progress":
+                rank = self._state["Rank"]
                 for k, v in entry.items():
                     if k in rank:
                         # perhaps not taken promotion mission yet
                         rank[k] = (rank[k][0], min(v, 100))
 
-            elif event_type in ('reputation', 'statistics'):
+            elif event_type in ("reputation", "statistics"):
                 payload = dict(entry)
-                payload.pop('event')
-                payload.pop('timestamp')
+                payload.pop("event")
+                payload.pop("timestamp")
                 # NB: We need the original casing for these keys
-                self.state[entry['event']] = payload
+                self._state[entry["event"]] = payload
 
-            elif event_type == 'engineerprogress':
+            elif event_type == "engineerprogress":
                 # Sanity check - at least once the 'Engineer' (name) was missing from this in early
-                # Odyssey 4.0.0.100.  Might only have been a server issue causing incomplete data.
+                # Odyssey 4.0.0.100.  Might only have been a server issue causing incomplete schema.
 
                 if self.event_valid_engineerprogress(entry):
-                    engineers = self.state['Engineers']
-                    if 'Engineers' in entry:  # Startup summary
-                        self.state['Engineers'] = {
-                            e['Engineer']: ((e['Rank'], e.get('RankProgress', 0)) if 'Rank' in e else e['Progress'])
-                            for e in entry['Engineers']
+                    engineers = self._state["Engineers"]
+                    if "Engineers" in entry:  # Startup summary
+                        self._state["Engineers"] = {
+                            e["Engineer"]: (
+                                (e["Rank"], e.get("RankProgress", 0))
+                                if "Rank" in e
+                                else e["Progress"]
+                            )
+                            for e in entry["Engineers"]
                         }
 
                     else:  # Promotion
-                        engineer = entry['Engineer']
-                        if 'Rank' in entry:
-                            engineers[engineer] = (entry['Rank'], entry.get('RankProgress', 0))
+                        engineer = entry["Engineer"]
+                        if "Rank" in entry:
+                            engineers[engineer] = (
+                                entry["Rank"],
+                                entry.get("RankProgress", 0),
+                            )
 
                         else:
-                            engineers[engineer] = entry['Progress']
+                            engineers[engineer] = entry["Progress"]
 
-            elif event_type == 'cargo' and entry.get('Vessel') == 'Ship':
-                self.state['Cargo'] = defaultdict(int)
+            elif event_type == "cargo" and entry.get("Vessel") == "Ship":
+                self._state["Cargo"] = defaultdict(int)
                 # From 3.3 full Cargo event (after the first one) is written to a separate file
-                if 'Inventory' not in entry:
-                    async with await anyio.open_file(self.journal_dir / 'Cargo.json', 'r') as h:
+                if "Inventory" not in entry:
+                    async with await anyio.open_file(
+                        self.journal_dir / "Cargo.json", "r"
+                    ) as h:
                         entry = orjson.loads(await h.read())
-                        self.state['CargoJSON'] = entry
+                        self._state["CargoJSON"] = entry
 
-                clean = self.coalesce_cargo(entry['Inventory'])
+                clean = self.coalesce_cargo(entry["Inventory"])
 
-                self.state['Cargo'].update({self.canonicalise(x['Name']): x['Count'] for x in clean})
+                self._state["Cargo"].update(
+                    {self.canonicalise(x["Name"]): x["Count"] for x in clean}
+                )
 
-            elif event_type == 'cargotransfer':
-                for c in entry['Transfers']:
-                    name = self.canonicalise(c['Type'])
-                    if c['Direction'] == 'toship':
-                        self.state['Cargo'][name] += c['Count']
+            elif event_type == "cargotransfer":
+                for c in entry["Transfers"]:
+                    name = self.canonicalise(c["Type"])
+                    if c["Direction"] == "toship":
+                        self._state["Cargo"][name] += c["Count"]
 
                     else:
                         # So it's *from* the ship
-                        self.state['Cargo'][name] -= c['Count']
+                        self._state["Cargo"][name] -= c["Count"]
 
-            elif event_type == 'shiplocker':
+            elif event_type == "shiplocker":
                 # As of 4.0.0.400 (2021-06-10)
                 # "ShipLocker" will be a full list written to the journal at startup/boarding, and also
                 # written to a separate shiplocker.json file - other updates will just update that file and mention it
@@ -874,177 +954,203 @@ class Journal(api.Journal):
 
                 # Always attempt loading of this, but if it fails we'll hope this was
                 # a startup/boarding version and thus `entry` contains
-                # the data anyway.
+                # the schema anyway.
                 currentdir_path = self.journal_dir
-                shiplocker_filename = currentdir_path / 'ShipLocker.json'
+                shiplocker_filename = currentdir_path / "ShipLocker.json"
                 shiplocker_max_attempts = 5
                 shiplocker_fail_sleep = 0.01
                 attempts = 0
                 while attempts < shiplocker_max_attempts:
                     attempts += 1
                     try:
-                        async with await anyio.open_file(shiplocker_filename, 'r') as h:
+                        async with await anyio.open_file(shiplocker_filename, "r") as h:
                             entry = json.loads(await h.read())
-                            self.state['ShipLockerJSON'] = entry
+                            self._state["ShipLockerJSON"] = entry
                             break
 
                     except FileNotFoundError:
-                        logger.warning('ShipLocker event but no ShipLocker.json file')
+                        logger.warning("ShipLocker event but no ShipLocker.json file")
                         await anyio.sleep(shiplocker_fail_sleep)
                         pass
 
                     except json.JSONDecodeError as e:
-                        logger.warning(f'ShipLocker.json failed to decode:\n{e!r}\n')
+                        logger.warning(f"ShipLocker.json failed to decode:\n{e!r}\n")
                         await anyio.sleep(shiplocker_fail_sleep)
                         pass
 
                 else:
-                    logger.warning(f'Failed to load & decode shiplocker after {shiplocker_max_attempts} tries. '
-                                   'Giving up.')
+                    logger.warning(
+                        f"Failed to load & decode shiplocker after {shiplocker_max_attempts} tries. "
+                        "Giving up."
+                    )
 
-                if not all(t in entry for t in ('Components', 'Consumables', 'Data', 'Items')):
-                    logger.warning('ShipLocker event is missing at least one category')
+                if not all(
+                    t in entry for t in ("Components", "Consumables", "Data", "Items")
+                ):
+                    logger.warning("ShipLocker event is missing at least one category")
 
-                # This event has the current totals, so drop any current data
-                self.state['Component'] = defaultdict(int)
-                self.state['Consumable'] = defaultdict(int)
-                self.state['Item'] = defaultdict(int)
-                self.state['Data'] = defaultdict(int)
+                # This event has the current totals, so drop any current schema
+                self._state["Component"] = defaultdict(int)
+                self._state["Consumable"] = defaultdict(int)
+                self._state["Item"] = defaultdict(int)
+                self._state["Data"] = defaultdict(int)
 
-                clean_components = self.coalesce_cargo(entry['Components'])
-                self.state['Component'].update(
-                    {self.canonicalise(x['Name']): x['Count'] for x in clean_components}
+                clean_components = self.coalesce_cargo(entry["Components"])
+                self._state["Component"].update(
+                    {self.canonicalise(x["Name"]): x["Count"] for x in clean_components}
                 )
 
-                clean_consumables = self.coalesce_cargo(entry['Consumables'])
-                self.state['Consumable'].update(
-                    {self.canonicalise(x['Name']): x['Count'] for x in clean_consumables}
+                clean_consumables = self.coalesce_cargo(entry["Consumables"])
+                self._state["Consumable"].update(
+                    {
+                        self.canonicalise(x["Name"]): x["Count"]
+                        for x in clean_consumables
+                    }
                 )
 
-                clean_items = self.coalesce_cargo(entry['Items'])
-                self.state['Item'].update(
-                    {self.canonicalise(x['Name']): x['Count'] for x in clean_items}
+                clean_items = self.coalesce_cargo(entry["Items"])
+                self._state["Item"].update(
+                    {self.canonicalise(x["Name"]): x["Count"] for x in clean_items}
                 )
 
-                clean_data = self.coalesce_cargo(entry['Data'])
-                self.state['Data'].update(
-                    {self.canonicalise(x['Name']): x['Count'] for x in clean_data}
+                clean_data = self.coalesce_cargo(entry["Data"])
+                self._state["Data"].update(
+                    {self.canonicalise(x["Name"]): x["Count"] for x in clean_data}
                 )
 
             # Journal v31 implies this was removed before Odyssey launch
-            elif event_type == 'backpackmaterials':
+            elif event_type == "backpackmaterials":
                 # Last seen in a 4.0.0.102 journal file.
-                logger.warning(f'We have a BackPackMaterials event, defunct since > 4.0.0.102 ?:\n{entry}\n')
+                logger.warning(
+                    f"We have a BackPackMaterials event, defunct since > 4.0.0.102 ?:\n{entry}\n"
+                )
                 pass
 
-            elif event_type in ('backpack', 'resupply'):
+            elif event_type in ("backpack", "resupply"):
                 # as of v4.0.0.600, a `resupply` event is dropped when resupplying your suit at your ship.
-                # This event writes the same data as a backpack event. It will also be followed by a ShipLocker
+                # This event writes the same schema as a backpack event. It will also be followed by a ShipLocker
                 # but that follows normal behaviour in its handler.
 
                 # TODO: v31 doc says this is`backpack.json` ... but Howard Chalkley
                 #       said it's `Backpack.json`
-                backpack_file = self.journal_dir / 'Backpack.json'
+                backpack_file = self.journal_dir / "Backpack.json"
                 backpack_data = None
 
                 if not backpack_file.exists():
-                    logger.warning(f'Failed to find backpack.json file as it appears not to exist? {backpack_file=}')
+                    logger.warning(
+                        f"Failed to find backpack.json file as it appears not to exist? {backpack_file=}"
+                    )
 
                 else:
-                    async with await anyio.open_file(backpack_file, 'r') as h:
+                    async with await anyio.open_file(backpack_file, "r") as h:
                         backpack_data = await h.read()
 
                 parsed: MutableMapping[str, Any] | None = None
 
                 if backpack_data is None:
-                    logger.warning('Unable to read backpack data!')
+                    logger.warning("Unable to read backpack schema!")
 
                 elif len(backpack_data) == 0:
-                    logger.warning('Backpack.json was empty when we read it!')
+                    logger.warning("Backpack.json was empty when we read it!")
 
                 else:
                     try:
                         parsed = json.loads(backpack_data)
 
                     except json.JSONDecodeError:
-                        logger.exception('Unable to parse Backpack.json')
+                        logger.exception("Unable to parse Backpack.json")
 
                 if parsed is not None:
-                    entry: MutableMapping[str, Any] = parsed  # set entry so that it ends up in plugins with the right data
+                    entry: MutableMapping[str, Any] = (
+                        parsed  # set entry so that it ends up in plugins with the right schema
+                    )
                     # Store in monitor.state
-                    self.state['BackpackJSON'] = entry
+                    self._state["BackpackJSON"] = entry
 
                     # Assume this reflects the current state when written
                     self.backpack_set_empty()
 
-                    clean_components = self.coalesce_cargo(entry['Components'])
-                    self.state['BackPack']['Component'].update(
-                        {self.canonicalise(x['Name']): x['Count'] for x in clean_components}
+                    clean_components = self.coalesce_cargo(entry["Components"])
+                    self._state["BackPack"]["Component"].update(
+                        {
+                            self.canonicalise(x["Name"]): x["Count"]
+                            for x in clean_components
+                        }
                     )
 
-                    clean_consumables = self.coalesce_cargo(entry['Consumables'])
-                    self.state['BackPack']['Consumable'].update(
-                        {self.canonicalise(x['Name']): x['Count'] for x in clean_consumables}
+                    clean_consumables = self.coalesce_cargo(entry["Consumables"])
+                    self._state["BackPack"]["Consumable"].update(
+                        {
+                            self.canonicalise(x["Name"]): x["Count"]
+                            for x in clean_consumables
+                        }
                     )
 
-                    clean_items = self.coalesce_cargo(entry['Items'])
-                    self.state['BackPack']['Item'].update(
-                        {self.canonicalise(x['Name']): x['Count'] for x in clean_items}
+                    clean_items = self.coalesce_cargo(entry["Items"])
+                    self._state["BackPack"]["Item"].update(
+                        {self.canonicalise(x["Name"]): x["Count"] for x in clean_items}
                     )
 
-                    clean_data = self.coalesce_cargo(entry['Data'])
-                    self.state['BackPack']['Data'].update(
-                        {self.canonicalise(x['Name']): x['Count'] for x in clean_data}
+                    clean_data = self.coalesce_cargo(entry["Data"])
+                    self._state["BackPack"]["Data"].update(
+                        {self.canonicalise(x["Name"]): x["Count"] for x in clean_data}
                     )
 
-            elif event_type == 'backpackchange':
+            elif event_type == "backpackchange":
                 # Changes to Odyssey Backpack contents *other* than from a Transfer
                 # See TransferMicroResources event for that.
 
-                if entry.get('Added') is not None:
-                    changes = 'Added'
+                if entry.get("Added") is not None:
+                    changes = "Added"
 
-                elif entry.get('Removed') is not None:
-                    changes = 'Removed'
+                elif entry.get("Removed") is not None:
+                    changes = "Removed"
 
                 else:
-                    logger.warning(f'BackpackChange with neither Added nor Removed: {entry=}')
-                    changes = ''
+                    logger.warning(
+                        f"BackpackChange with neither Added nor Removed: {entry=}"
+                    )
+                    changes = ""
 
-                if changes != '':
+                if changes != "":
                     for c in entry[changes]:
-                        category = self.category(c['Type'])
-                        name = self.canonicalise(c['Name'])
+                        category = self.category(c["Type"])
+                        name = self.canonicalise(c["Name"])
 
-                        if changes == 'Removed':
-                            self.state['BackPack'][category][name] -= c['Count']
+                        if changes == "Removed":
+                            self._state["BackPack"][category][name] -= c["Count"]
 
-                        elif changes == 'Added':
-                            self.state['BackPack'][category][name] += c['Count']
+                        elif changes == "Added":
+                            self._state["BackPack"][category][name] += c["Count"]
 
                 # Paranoia check to see if anything has gone negative.
                 # As of Odyssey Alpha Phase 1 Hotfix 2 keeping track of BackPack
                 # materials is impossible when used/picked up anyway.
-                for c in self.state['BackPack']:
-                    for m in self.state['BackPack'][c]:
-                        if self.state['BackPack'][c][m] < 0:
-                            self.state['BackPack'][c][m] = 0
+                for c in self._state["BackPack"]:
+                    for m in self._state["BackPack"][c]:
+                        if self._state["BackPack"][c][m] < 0:
+                            self._state["BackPack"][c][m] = 0
 
-            elif event_type == 'buymicroresources':
+            elif event_type == "buymicroresources":
                 # From 4.0.0.400 we get an empty (see file) `ShipLocker` event,
                 # so we can ignore this for inventory purposes.
 
                 # But do record the credits balance change.
-                self.state['Credits'] -= entry.get('Price', 0)
+                self._state["Credits"] -= entry.get("Price", 0)
 
-            elif event_type == 'sellmicroresources':
+            elif event_type == "sellmicroresources":
                 # As of 4.0.0.400 we can ignore this as an empty (see file)
                 # `ShipLocker` event is written for the full new inventory.
 
                 # But still record the credits balance change.
-                self.state['Credits'] += entry.get('Price', 0)
+                self._state["Credits"] += entry.get("Price", 0)
 
-            elif event_type in ('tradeMicroResources', 'collectitems', 'dropitems', 'useconsumable'):
+            elif event_type in (
+                "tradeMicroResources",
+                "collectitems",
+                "dropitems",
+                "useconsumable",
+            ):
                 # As of 4.0.0.400 we can ignore these as an empty (see file)
                 # `ShipLocker` event and/or a `BackpackChange` is also written.
                 pass
@@ -1053,12 +1159,16 @@ class Journal(api.Journal):
             # also there's one additional journal event that was missed out from
             # this version of the docs: "SuitLoadout": # when starting on foot, or
             # when disembarking from a ship, with the same info as found in "CreateSuitLoadout"
-            elif event_type == 'suitloadout':
-                suit_slotid, suitloadout_slotid = self.suitloadout_store_from_event(entry)
-                if not self.suit_and_loadout_setcurrent(suit_slotid, suitloadout_slotid):
+            elif event_type == "suitloadout":
+                suit_slotid, suitloadout_slotid = self.suitloadout_store_from_event(
+                    entry
+                )
+                if not self.suit_and_loadout_setcurrent(
+                    suit_slotid, suitloadout_slotid
+                ):
                     logger.error(f"Event was: {entry}")
 
-            elif event_type == 'switchsuitloadout':
+            elif event_type == "switchsuitloadout":
                 # 4.0.0.101
                 #
                 # { "timestamp":"2021-05-21T10:39:43Z", "event":"SwitchSuitLoadout",
@@ -1076,7 +1186,7 @@ class Journal(api.Journal):
                 if not self.suit_and_loadout_setcurrent(suitid, suitloadout_slotid):
                     logger.error(f"Event was: {entry}")
 
-            elif event_type == 'createsuitloadout':
+            elif event_type == "createsuitloadout":
                 # 4.0.0.101
                 #
                 # { "timestamp":"2021-05-21T11:13:15Z", "event":"CreateSuitLoadout", "SuitID":1700216165682989,
@@ -1093,22 +1203,24 @@ class Journal(api.Journal):
                 #  if not self.suit_and_loadout_setcurrent(suitid, suitloadout_slotid):
                 #      logger.error(f"Event was: {entry}")
 
-            elif event_type == 'deletesuitloadout':
+            elif event_type == "deletesuitloadout":
                 # alpha4:
                 # { "timestamp":"2021-04-29T10:32:27Z", "event":"DeleteSuitLoadout", "SuitID":1698365752966423,
                 # "SuitName":"explorationsuit_class1", "SuitName_Localised":"Artemis Suit", "LoadoutID":4293000003,
                 # "LoadoutName":"Loadout 1" }
 
-                if self.state['SuitLoadouts']:
-                    loadout_id = self.suit_loadout_id_from_loadoutid(entry['LoadoutID'])
+                if self._state["SuitLoadouts"]:
+                    loadout_id = self.suit_loadout_id_from_loadoutid(entry["LoadoutID"])
                     try:
-                        self.state['SuitLoadouts'].pop(f'{loadout_id}')
+                        self._state["SuitLoadouts"].pop(f"{loadout_id}")
 
                     except KeyError:
                         # This should no longer happen, as we're now handling CreateSuitLoadout properly
-                        logger.debug(f"loadout slot id {loadout_id} doesn't exist, not in last CAPI pull ?")
+                        logger.debug(
+                            f"loadout slot id {loadout_id} doesn't exist, not in last CAPI pull ?"
+                        )
 
-            elif event_type == 'renamesuitloadout':
+            elif event_type == "renamesuitloadout":
                 # alpha4
                 # Parameters:
                 #     • SuitID
@@ -1119,36 +1231,42 @@ class Journal(api.Journal):
                 # { "timestamp":"2021-04-29T10:35:55Z", "event":"RenameSuitLoadout", "SuitID":1698365752966423,
                 # "SuitName":"explorationsuit_class1", "SuitName_Localised":"Artemis Suit", "LoadoutID":4293000003,
                 # "LoadoutName":"Art L/K" }
-                if self.state['SuitLoadouts']:
-                    loadout_id = self.suit_loadout_id_from_loadoutid(entry['LoadoutID'])
+                if self._state["SuitLoadouts"]:
+                    loadout_id = self.suit_loadout_id_from_loadoutid(entry["LoadoutID"])
                     try:
-                        self.state['SuitLoadouts'][loadout_id]['name'] = entry['LoadoutName']
+                        self._state["SuitLoadouts"][loadout_id]["name"] = entry[
+                            "LoadoutName"
+                        ]
 
                     except KeyError:
-                        logger.debug(f"loadout slot id {loadout_id} doesn't exist, not in last CAPI pull ?")
+                        logger.debug(
+                            f"loadout slot id {loadout_id} doesn't exist, not in last CAPI pull ?"
+                        )
 
-            elif event_type == 'buysuit':
+            elif event_type == "buysuit":
                 # alpha4 :
                 # { "timestamp":"2021-04-29T09:03:37Z", "event":"BuySuit", "Name":"UtilitySuit_Class1",
                 # "Name_Localised":"Maverick Suit", "Price":150000, "SuitID":1698364934364699 }
-                loc_name = entry.get('Name_Localised', entry['Name'])
-                self.state['Suits'][entry['SuitID']] = {
-                    'name':      entry['Name'],
-                    'locName':   loc_name,
-                    'edmcName':  self.suit_sane_name(loc_name),
-                    'id':        None,  # Is this an FDev ID for suit type ?
-                    'suitId':    entry['SuitID'],
-                    'mods':      entry['SuitMods'],  # Suits can (rarely) be bought with modules installed
+                loc_name = entry.get("Name_Localised", entry["Name"])
+                self._state["Suits"][entry["SuitID"]] = {
+                    "name": entry["Name"],
+                    "locName": loc_name,
+                    "edmcName": self.suit_sane_name(loc_name),
+                    "id": None,  # Is this an FDev ID for suit type ?
+                    "suitId": entry["SuitID"],
+                    "mods": entry[
+                        "SuitMods"
+                    ],  # Suits can (rarely) be bought with modules installed
                 }
 
                 # update credits
-                if price := entry.get('Price') is None:
+                if price := entry.get("Price") is None:
                     logger.error(f"BuySuit didn't contain Price: {entry}")
 
                 else:
-                    self.state['Credits'] -= price
+                    self._state["Credits"] -= price
 
-            elif event_type == 'sellsuit':
+            elif event_type == "sellsuit":
                 # Remove from known suits
                 # As of Odyssey Alpha Phase 2, Hotfix 5 (4.0.0.13) this isn't possible as this event
                 # doesn't contain the specific suit ID as per CAPI `suits` dict.
@@ -1162,21 +1280,23 @@ class Journal(api.Journal):
                 # alpha4:
                 # { "timestamp":"2021-04-29T09:15:51Z", "event":"SellSuit", "SuitID":1698364937435505,
                 # "Name":"explorationsuit_class1", "Name_Localised":"Artemis Suit", "Price":90000 }
-                if self.state['Suits']:
+                if self._state["Suits"]:
                     try:
-                        self.state['Suits'].pop(entry['SuitID'])
+                        self._state["Suits"].pop(entry["SuitID"])
 
                     except KeyError:
-                        logger.debug(f"SellSuit for a suit we didn't know about? {entry['SuitID']}")
+                        logger.debug(
+                            f"SellSuit for a suit we didn't know about? {entry['SuitID']}"
+                        )
 
                     # update credits total
-                    if price := entry.get('Price') is None:
+                    if price := entry.get("Price") is None:
                         logger.error(f"SellSuit didn't contain Price: {entry}")
 
                     else:
-                        self.state['Credits'] += price
+                        self._state["Credits"] += price
 
-            elif event_type == 'upgradesuit':
+            elif event_type == "upgradesuit":
                 # alpha4
                 # This event is logged when the player upgrades their flight suit
                 #
@@ -1185,58 +1305,64 @@ class Journal(api.Journal):
                 #     • SuitID
                 #     • Class
                 #     • Cost
-                # TODO: Update self.state['Suits'] when we have an example to work from
-                self.state['Credits'] -= entry.get('Cost', 0)
+                # TODO: Update self._state['Suits'] when we have an example to work from
+                self._state["Credits"] -= entry.get("Cost", 0)
 
-            elif event_type == 'loadoutequipmodule':
+            elif event_type == "loadoutequipmodule":
                 # alpha4:
                 # { "timestamp":"2021-04-29T11:11:13Z", "event":"LoadoutEquipModule", "LoadoutName":"Dom L/K/K",
                 # "SuitID":1698364940285172, "SuitName":"tacticalsuit_class1", "SuitName_Localised":"Dominator Suit",
                 # "LoadoutID":4293000001, "SlotName":"PrimaryWeapon2", "ModuleName":"wpn_m_assaultrifle_laser_fauto",
                 # "ModuleName_Localised":"TK Aphelion", "SuitModuleID":1698372938719590 }
-                if self.state['SuitLoadouts']:
-                    loadout_id = self.suit_loadout_id_from_loadoutid(entry['LoadoutID'])
+                if self._state["SuitLoadouts"]:
+                    loadout_id = self.suit_loadout_id_from_loadoutid(entry["LoadoutID"])
                     try:
-                        self.state['SuitLoadouts'][loadout_id]['slots'][entry['SlotName']] = {
-                            'name':           entry['ModuleName'],
-                            'locName':        entry.get('ModuleName_Localised', entry['ModuleName']),
-                            'id':             None,
-                            'weaponrackId':   entry['SuitModuleID'],
-                            'locDescription': '',
-                            'class':          entry['Class'],
-                            'mods':           entry['WeaponMods']
+                        self._state["SuitLoadouts"][loadout_id]["slots"][
+                            entry["SlotName"]
+                        ] = {
+                            "name": entry["ModuleName"],
+                            "locName": entry.get(
+                                "ModuleName_Localised", entry["ModuleName"]
+                            ),
+                            "id": None,
+                            "weaponrackId": entry["SuitModuleID"],
+                            "locDescription": "",
+                            "class": entry["Class"],
+                            "mods": entry["WeaponMods"],
                         }
 
                     except KeyError:
                         # TODO: Log the exception details too, for some clue about *which* key
                         logger.error(f"LoadoutEquipModule: {entry}")
 
-            elif event_type == 'loadoutremovemodule':
+            elif event_type == "loadoutremovemodule":
                 # alpha4 - triggers if selecting an already-equipped weapon into a different slot
                 # { "timestamp":"2021-04-29T11:11:13Z", "event":"LoadoutRemoveModule", "LoadoutName":"Dom L/K/K",
                 # "SuitID":1698364940285172, "SuitName":"tacticalsuit_class1", "SuitName_Localised":"Dominator Suit",
                 # "LoadoutID":4293000001, "SlotName":"PrimaryWeapon1", "ModuleName":"wpn_m_assaultrifle_laser_fauto",
                 # "ModuleName_Localised":"TK Aphelion", "SuitModuleID":1698372938719590 }
-                if self.state['SuitLoadouts']:
-                    loadout_id = self.suit_loadout_id_from_loadoutid(entry['LoadoutID'])
+                if self._state["SuitLoadouts"]:
+                    loadout_id = self.suit_loadout_id_from_loadoutid(entry["LoadoutID"])
                     try:
-                        self.state['SuitLoadouts'][loadout_id]['slots'].pop(entry['SlotName'])
+                        self._state["SuitLoadouts"][loadout_id]["slots"].pop(
+                            entry["SlotName"]
+                        )
 
                     except KeyError:
                         logger.error(f"LoadoutRemoveModule: {entry}")
 
-            elif event_type == 'buyweapon':
+            elif event_type == "buyweapon":
                 # alpha4
                 # { "timestamp":"2021-04-29T11:10:51Z", "event":"BuyWeapon", "Name":"Wpn_M_AssaultRifle_Laser_FAuto",
                 # "Name_Localised":"TK Aphelion", "Price":125000, "SuitModuleID":1698372938719590 }
                 # update credits
-                if price := entry.get('Price') is None:
+                if price := entry.get("Price") is None:
                     logger.error(f"BuyWeapon didn't contain Price: {entry}")
 
                 else:
-                    self.state['Credits'] -= price
+                    self._state["Credits"] -= price
 
-            elif event_type == 'sellweapon':
+            elif event_type == "sellweapon":
                 # We're not actually keeping track of all owned weapons, only those in
                 # Suit Loadouts.
                 # alpha4:
@@ -1245,37 +1371,40 @@ class Journal(api.Journal):
 
                 # We need to look over all Suit Loadouts for ones that used this specific weapon
                 # and update them to entirely empty that slot.
-                for sl in self.state['SuitLoadouts']:
-                    for w in self.state['SuitLoadouts'][sl]['slots']:
-                        if self.state['SuitLoadouts'][sl]['slots'][w]['weaponrackId'] == entry['SuitModuleID']:
-                            self.state['SuitLoadouts'][sl]['slots'].pop(w)
+                for sl in self._state["SuitLoadouts"]:
+                    for w in self._state["SuitLoadouts"][sl]["slots"]:
+                        if (
+                            self._state["SuitLoadouts"][sl]["slots"][w]["weaponrackId"]
+                            == entry["SuitModuleID"]
+                        ):
+                            self._state["SuitLoadouts"][sl]["slots"].pop(w)
                             # We've changed the dict, so iteration breaks, but also the weapon
                             # could only possibly have been here once.
                             break
 
                 # Update credits total
-                if price := entry.get('Price') is None:
+                if price := entry.get("Price") is None:
                     logger.error(f"SellWeapon didn't contain Price: {entry}")
 
                 else:
-                    self.state['Credits'] += price
+                    self._state["Credits"] += price
 
-            elif event_type == 'upgradeweapon':
+            elif event_type == "upgradeweapon":
                 # We're not actually keeping track of all owned weapons, only those in
                 # Suit Loadouts.
-                self.state['Credits'] -= entry.get('Cost', 0)
+                self._state["Credits"] -= entry.get("Cost", 0)
 
-            elif event_type == 'scanorganic':
+            elif event_type == "scanorganic":
                 # Nothing of interest to our state.
                 pass
 
-            elif event_type == 'sellorganicdata':
-                for bd in entry['BioData']:
-                    self.state['Credits'] += bd.get('Value', 0) + bd.get('Bonus', 0)
+            elif event_type == "sellorganicdata":
+                for bd in entry["BioData"]:
+                    self._state["Credits"] += bd.get("Value", 0) + bd.get("Bonus", 0)
 
-            elif event_type == 'bookdropship':
-                self.state['Credits'] -= entry.get('Cost', 0)
-                self.state['Dropship'] = True
+            elif event_type == "bookdropship":
+                self._state["Credits"] -= entry.get("Cost", 0)
+                self._state["Dropship"] = True
                 # Technically we *might* now not be OnFoot.
                 # The problem is that this event is recorded both for signing up for
                 # an on-foot CZ, and when you use the Dropship to return after the
@@ -1287,343 +1416,357 @@ class Journal(api.Journal):
                 # not still on-foot, BUT it doesn't really matter as the next significant
                 # event is going to be Disembark to on-foot anyway.
 
-            elif event_type == 'booktaxi':
-                self.state['Credits'] -= entry.get('Cost', 0)
+            elif event_type == "booktaxi":
+                self._state["Credits"] -= entry.get("Cost", 0)
                 # Dont set taxi state here, as we're not IN a taxi yet. Set it on Embark
 
-            elif event_type == 'canceldropship':
-                self.state['Credits'] += entry.get('Refund', 0)
-                self.state['Dropship'] = False
-                self.state['Taxi'] = False
+            elif event_type == "canceldropship":
+                self._state["Credits"] += entry.get("Refund", 0)
+                self._state["Dropship"] = False
+                self._state["Taxi"] = False
 
-            elif event_type == 'canceltaxi':
-                self.state['Credits'] += entry.get('Refund', 0)
-                self.state['Taxi'] = False
+            elif event_type == "canceltaxi":
+                self._state["Credits"] += entry.get("Refund", 0)
+                self._state["Taxi"] = False
 
-            elif event_type == 'navroute' and not self.replay:
-                # assume we've failed out the gate, then pull it back if things are fine
-                self._last_navroute_journal_timestamp = mktime(strptime(entry['timestamp'], '%Y-%m-%dT%H:%M:%SZ'))
-                self._navroute_retries_remaining = 11
-
-                # Added in ED 3.7 - multi-hop route details in NavRoute.json
-                # rather than duplicating this, lets just call the function
-                if await self.__navroute_retry():
-                    entry = self.state['NavRoute']
-
-            elif event_type == 'fcmaterials' and not self.replay:
-                # assume we've failed out the gate, then pull it back if things are fine
-                self._last_fcmaterials_journal_timestamp = mktime(strptime(entry['timestamp'], '%Y-%m-%dT%H:%M:%SZ'))
-                self._fcmaterials_retries_remaining = 11
-
-                # Added in ED 4.0.0.1300 - Fleet Carrier Materials market in FCMaterials.json
-                # rather than duplicating this, lets just call the function
-                if fcmaterials := await self.__fcmaterials_retry():
-                    entry = fcmaterials
-
-            elif event_type == 'moduleinfo':
-                async with await anyio.open_file(self.journal_dir / 'ModulesInfo.json', 'r') as mf:  # type: ignore
+            elif event_type == "market" and not self.replay:
+                self.pending_market = entry
+                return {}
+            elif event_type == "shipyard" and not self.replay:
+                self.pending_shipyard = entry
+                return {}
+            elif event_type == "navroute" and not self.replay:
+                self.pending_navroute = entry
+                return {}
+            elif event_type == "outfitting" and not self.replay:
+                self.pending_outfitting = entry
+                return {}
+            elif event_type == "fcmaterials" and not self.replay:
+                self.pending_fcmaterials = entry
+                return {}
+            elif event_type == "moduleinfo":
+                async with await anyio.open_file(
+                    self.journal_dir / "ModulesInfo.json", "r"
+                ) as mf:  # type: ignore
                     try:
                         entry = json.loads(await mf.read())
 
                     except json.JSONDecodeError:
-                        logger.exception('Failed decoding ModulesInfo.json')
+                        logger.exception("Failed decoding ModulesInfo.json")
 
                     else:
-                        self.state['ModuleInfo'] = entry
+                        self._state["ModuleInfo"] = entry
 
-            elif event_type in ('collectcargo', 'marketbuy', 'buydrones', 'miningrefined'):
-                commodity = self.canonicalise(entry['Type'])
-                self.state['Cargo'][commodity] += entry.get('Count', 1)
+            elif event_type in (
+                "collectcargo",
+                "marketbuy",
+                "buydrones",
+                "miningrefined",
+            ):
+                commodity = self.canonicalise(entry["Type"])
+                self._state["Cargo"][commodity] += entry.get("Count", 1)
 
-                if event_type == 'buydrones':
-                    self.state['Credits'] -= entry.get('TotalCost', 0)
+                if event_type == "buydrones":
+                    self._state["Credits"] -= entry.get("TotalCost", 0)
 
-                elif event_type == 'marketbuy':
-                    self.state['Credits'] -= entry.get('TotalCost', 0)
+                elif event_type == "marketbuy":
+                    self._state["Credits"] -= entry.get("TotalCost", 0)
 
-            elif event_type in ('ejectcargo', 'marketsell', 'selldrones'):
-                commodity = self.canonicalise(entry['Type'])
-                cargo = self.state['Cargo']
-                cargo[commodity] -= entry.get('Count', 1)
+            elif event_type in ("ejectcargo", "marketsell", "selldrones"):
+                commodity = self.canonicalise(entry["Type"])
+                cargo = self._state["Cargo"]
+                cargo[commodity] -= entry.get("Count", 1)
                 if cargo[commodity] <= 0:
                     cargo.pop(commodity)
 
-                if event_type == 'marketsell':
-                    self.state['Credits'] += entry.get('TotalSale', 0)
+                if event_type == "marketsell":
+                    self._state["Credits"] += entry.get("TotalSale", 0)
 
-                elif event_type == 'selldrones':
-                    self.state['Credits'] += entry.get('TotalSale', 0)
+                elif event_type == "selldrones":
+                    self._state["Credits"] += entry.get("TotalSale", 0)
 
-            elif event_type == 'searchandrescue':
-                for item in entry.get('Items', []):
-                    commodity = self.canonicalise(item['Name'])
-                    cargo = self.state['Cargo']
-                    cargo[commodity] -= item.get('Count', 1)
+            elif event_type == "searchandrescue":
+                for item in entry.get("Items", []):
+                    commodity = self.canonicalise(item["Name"])
+                    cargo = self._state["Cargo"]
+                    cargo[commodity] -= item.get("Count", 1)
                     if cargo[commodity] <= 0:
                         cargo.pop(commodity)
 
-            elif event_type == 'materials':
-                for category in ('Raw', 'Manufactured', 'Encoded'):
-                    self.state[category] = defaultdict(int)
-                    self.state[category].update({
-                        self.canonicalise(x['Name']): x['Count'] for x in entry.get(category, [])
-                    })
+            elif event_type == "materials":
+                for category in ("Raw", "Manufactured", "Encoded"):
+                    self._state[category] = defaultdict(int)
+                    self._state[category].update(
+                        {
+                            self.canonicalise(x["Name"]): x["Count"]
+                            for x in entry.get(category, [])
+                        }
+                    )
 
-            elif event_type == 'materialcollected':
-                material = self.canonicalise(entry['Name'])
-                self.state[entry['Category']][material] += entry['Count']
+            elif event_type == "materialcollected":
+                material = self.canonicalise(entry["Name"])
+                self._state[entry["Category"]][material] += entry["Count"]
 
-            elif event_type in ('materialdiscarded', 'scientificresearch'):
-                material = self.canonicalise(entry['Name'])
-                state_category = self.state[entry['Category']]
-                state_category[material] -= entry['Count']
+            elif event_type in ("materialdiscarded", "scientificresearch"):
+                material = self.canonicalise(entry["Name"])
+                state_category = self._state[entry["Category"]]
+                state_category[material] -= entry["Count"]
                 if state_category[material] <= 0:
                     state_category.pop(material)
 
-            elif event_type == 'synthesis':
-                for category in ('Raw', 'Manufactured', 'Encoded'):
-                    for x in entry['Materials']:
-                        material = self.canonicalise(x['Name'])
-                        if material in self.state[category]:
-                            self.state[category][material] -= x['Count']
-                            if self.state[category][material] <= 0:
-                                self.state[category].pop(material)
+            elif event_type == "synthesis":
+                for category in ("Raw", "Manufactured", "Encoded"):
+                    for x in entry["Materials"]:
+                        material = self.canonicalise(x["Name"])
+                        if material in self._state[category]:
+                            self._state[category][material] -= x["Count"]
+                            if self._state[category][material] <= 0:
+                                self._state[category].pop(material)
 
-            elif event_type == 'materialtrade':
-                category = self.category(entry['Paid']['Category'])
-                state_category = self.state[category]
-                paid = entry['Paid']
-                received = entry['Received']
+            elif event_type == "materialtrade":
+                category = self.category(entry["Paid"]["Category"])
+                state_category = self._state[category]
+                paid = entry["Paid"]
+                received = entry["Received"]
 
-                state_category[paid['Material']] -= paid['Quantity']
-                if state_category[paid['Material']] <= 0:
-                    state_category.pop(paid['Material'])
+                state_category[paid["Material"]] -= paid["Quantity"]
+                if state_category[paid["Material"]] <= 0:
+                    state_category.pop(paid["Material"])
 
-                category = self.category(received['Category'])
-                state_category[received['Material']] += received['Quantity']
+                category = self.category(received["Category"])
+                state_category[received["Material"]] += received["Quantity"]
 
-            elif event_type == 'engineercraft' or (
-                event_type == 'engineerlegacyconvert' and not entry.get('IsPreview')
+            elif event_type == "engineercraft" or (
+                event_type == "engineerlegacyconvert" and not entry.get("IsPreview")
             ):
+                for category in ("Raw", "Manufactured", "Encoded"):
+                    for x in entry.get("Ingredients", []):
+                        material = self.canonicalise(x["Name"])
+                        if material in self._state[category]:
+                            self._state[category][material] -= x["Count"]
+                            if self._state[category][material] <= 0:
+                                self._state[category].pop(material)
 
-                for category in ('Raw', 'Manufactured', 'Encoded'):
-                    for x in entry.get('Ingredients', []):
-                        material = self.canonicalise(x['Name'])
-                        if material in self.state[category]:
-                            self.state[category][material] -= x['Count']
-                            if self.state[category][material] <= 0:
-                                self.state[category].pop(material)
-
-                module = self.state['Modules'][entry['Slot']]
-                if module['Item'] != self.canonicalise(entry['Module']):
+                module = self._state["Modules"][entry["Slot"]]
+                if module["Item"] != self.canonicalise(entry["Module"]):
                     raise ValueError(f"Module {entry['Slot']} is not {entry['Module']}")
-                module['Engineering'] = {
-                    'Engineer':      entry['Engineer'],
-                    'EngineerID':    entry['EngineerID'],
-                    'BlueprintName': entry['BlueprintName'],
-                    'BlueprintID':   entry['BlueprintID'],
-                    'Level':         entry['Level'],
-                    'Quality':       entry['Quality'],
-                    'Modifiers':     entry['Modifiers'],
+                module["Engineering"] = {
+                    "Engineer": entry["Engineer"],
+                    "EngineerID": entry["EngineerID"],
+                    "BlueprintName": entry["BlueprintName"],
+                    "BlueprintID": entry["BlueprintID"],
+                    "Level": entry["Level"],
+                    "Quality": entry["Quality"],
+                    "Modifiers": entry["Modifiers"],
                 }
 
-                if 'ExperimentalEffect' in entry:
-                    module['Engineering']['ExperimentalEffect'] = entry['ExperimentalEffect']
-                    module['Engineering']['ExperimentalEffect_Localised'] = entry['ExperimentalEffect_Localised']
+                if "ExperimentalEffect" in entry:
+                    module["Engineering"]["ExperimentalEffect"] = entry[
+                        "ExperimentalEffect"
+                    ]
+                    module["Engineering"]["ExperimentalEffect_Localised"] = entry[
+                        "ExperimentalEffect_Localised"
+                    ]
 
                 else:
-                    module['Engineering'].pop('ExperimentalEffect', None)
-                    module['Engineering'].pop('ExperimentalEffect_Localised', None)
+                    module["Engineering"].pop("ExperimentalEffect", None)
+                    module["Engineering"].pop("ExperimentalEffect_Localised", None)
 
-            elif event_type == 'missioncompleted':
-                self.state['Credits'] += entry.get('Reward', 0)
+            elif event_type == "missioncompleted":
+                self._state["Credits"] += entry.get("Reward", 0)
 
-                for reward in entry.get('CommodityReward', []):
-                    commodity = self.canonicalise(reward['Name'])
-                    self.state['Cargo'][commodity] += reward.get('Count', 1)
+                for reward in entry.get("CommodityReward", []):
+                    commodity = self.canonicalise(reward["Name"])
+                    self._state["Cargo"][commodity] += reward.get("Count", 1)
 
-                for reward in entry.get('MaterialsReward', []):
-                    if 'Category' in reward:  # Category not present in E:D 3.0
-                        category = self.category(reward['Category'])
-                        material = self.canonicalise(reward['Name'])
-                        if category == 'Elements':
-                            category = 'Raw'
-                        self.state[category][material] += reward.get('Count', 1)
+                for reward in entry.get("MaterialsReward", []):
+                    if "Category" in reward:  # Category not present in E:D 3.0
+                        category = self.category(reward["Category"])
+                        material = self.canonicalise(reward["Name"])
+                        if category == "Elements":
+                            category = "Raw"
+                        self._state[category][material] += reward.get("Count", 1)
 
-            elif event_type == 'engineercontribution':
-                commodity = self.canonicalise(entry.get('Commodity'))
+            elif event_type == "engineercontribution":
+                commodity = self.canonicalise(entry.get("Commodity"))
                 if commodity:
-                    self.state['Cargo'][commodity] -= entry['Quantity']
-                    if self.state['Cargo'][commodity] <= 0:
-                        self.state['Cargo'].pop(commodity)
+                    self._state["Cargo"][commodity] -= entry["Quantity"]
+                    if self._state["Cargo"][commodity] <= 0:
+                        self._state["Cargo"].pop(commodity)
 
-                material = self.canonicalise(entry.get('Material'))
+                material = self.canonicalise(entry.get("Material"))
                 if material:
-                    for category in ('Raw', 'Manufactured', 'Encoded'):
-                        if material in self.state[category]:
-                            self.state[category][material] -= entry['Quantity']
-                            if self.state[category][material] <= 0:
-                                self.state[category].pop(material)
+                    for category in ("Raw", "Manufactured", "Encoded"):
+                        if material in self._state[category]:
+                            self._state[category][material] -= entry["Quantity"]
+                            if self._state[category][material] <= 0:
+                                self._state[category].pop(material)
 
-            elif event_type == 'technologybroker':
-                for thing in entry.get('Ingredients', []):  # 3.01
-                    for category in ('Cargo', 'Raw', 'Manufactured', 'Encoded'):
-                        item = self.canonicalise(thing['Name'])
-                        if item in self.state[category]:
-                            self.state[category][item] -= thing['Count']
-                            if self.state[category][item] <= 0:
-                                self.state[category].pop(item)
+            elif event_type == "technologybroker":
+                for thing in entry.get("Ingredients", []):  # 3.01
+                    for category in ("Cargo", "Raw", "Manufactured", "Encoded"):
+                        item = self.canonicalise(thing["Name"])
+                        if item in self._state[category]:
+                            self._state[category][item] -= thing["Count"]
+                            if self._state[category][item] <= 0:
+                                self._state[category].pop(item)
 
-                for thing in entry.get('Commodities', []):  # 3.02
-                    commodity = self.canonicalise(thing['Name'])
-                    self.state['Cargo'][commodity] -= thing['Count']
-                    if self.state['Cargo'][commodity] <= 0:
-                        self.state['Cargo'].pop(commodity)
+                for thing in entry.get("Commodities", []):  # 3.02
+                    commodity = self.canonicalise(thing["Name"])
+                    self._state["Cargo"][commodity] -= thing["Count"]
+                    if self._state["Cargo"][commodity] <= 0:
+                        self._state["Cargo"].pop(commodity)
 
-                for thing in entry.get('Materials', []):  # 3.02
-                    material = self.canonicalise(thing['Name'])
-                    category = thing['Category']
-                    self.state[category][material] -= thing['Count']
-                    if self.state[category][material] <= 0:
-                        self.state[category].pop(material)
+                for thing in entry.get("Materials", []):  # 3.02
+                    material = self.canonicalise(thing["Name"])
+                    category = thing["Category"]
+                    self._state[category][material] -= thing["Count"]
+                    if self._state[category][material] <= 0:
+                        self._state[category].pop(material)
 
-            elif event_type == 'joinacrew':
-                self.state['Captain'] = entry['Captain']
-                self.state['Role'] = 'Idle'
-                self.state['StarPos'] = None
-                self.state['SystemName'] = None
-                self.state['SystemAddress'] = None
-                self.state['SystemPopulation'] = None
-                self.state['StarPos'] = None
-                self.state['Body'] = None
-                self.state['BodyID'] = None
-                self.state['BodyType'] = None
-                self.state['StationName'] = None
-                self.state['MarketID'] = None
-                self.state['StationType'] = None
+            elif event_type == "joinacrew":
+                self._state["Captain"] = entry["Captain"]
+                self._state["Role"] = "Idle"
+                self._state["StarPos"] = None
+                self._state["SystemName"] = None
+                self._state["SystemAddress"] = None
+                self._state["SystemPopulation"] = None
+                self._state["StarPos"] = None
+                self._state["Body"] = None
+                self._state["BodyID"] = None
+                self._state["BodyType"] = None
+                self._state["StationName"] = None
+                self._state["MarketID"] = None
+                self._state["StationType"] = None
                 self.stationservices = None
-                self.state['OnFoot'] = False
+                self._state["OnFoot"] = False
 
-            elif event_type == 'changecrewrole':
-                self.state['Role'] = entry['Role']
+            elif event_type == "changecrewrole":
+                self._state["Role"] = entry["Role"]
 
-            elif event_type == 'quitacrew':
-                self.state['Captain'] = None
-                self.state['Role'] = None
-                self.state['SystemName'] = None
-                self.state['SystemAddress'] = None
-                self.state['SystemPopulation'] = None
-                self.state['StarPos'] = None
-                self.state['Body'] = None
-                self.state['BodyID'] = None
-                self.state['BodyType'] = None
-                self.state['StationName'] = None
-                self.state['MarketID'] = None
-                self.state['StationType'] = None
+            elif event_type == "quitacrew":
+                self._state["Captain"] = None
+                self._state["Role"] = None
+                self._state["SystemName"] = None
+                self._state["SystemAddress"] = None
+                self._state["SystemPopulation"] = None
+                self._state["StarPos"] = None
+                self._state["Body"] = None
+                self._state["BodyID"] = None
+                self._state["BodyType"] = None
+                self._state["StationName"] = None
+                self._state["MarketID"] = None
+                self._state["StationType"] = None
                 self.stationservices = None
 
                 # TODO: on_foot: Will we get an event after this to know ?
 
-            elif event_type == 'friends':
-                if entry['Status'] in ('Online', 'Added'):
-                    self.state['Friends'].add(entry['Name'])
+            elif event_type == "friends":
+                if entry["Status"] in ("Online", "Added"):
+                    self._state["Friends"].add(entry["Name"])
 
                 else:
-                    self.state['Friends'].discard(entry['Name'])
+                    self._state["Friends"].discard(entry["Name"])
 
             # Try to keep Credits total updated
-            elif event_type in ('multisellexplorationdata', 'sellexplorationdata'):
-                self.state['Credits'] += entry.get('TotalEarnings', 0)
+            elif event_type in ("multisellexplorationdata", "sellexplorationdata"):
+                self._state["Credits"] += entry.get("TotalEarnings", 0)
 
-            elif event_type == 'buyexplorationdata':
-                self.state['Credits'] -= entry.get('Cost', 0)
+            elif event_type == "buyexplorationdata":
+                self._state["Credits"] -= entry.get("Cost", 0)
 
-            elif event_type == 'buytradedata':
-                self.state['Credits'] -= entry.get('Cost', 0)
+            elif event_type == "buytradedata":
+                self._state["Credits"] -= entry.get("Cost", 0)
 
-            elif event_type == 'buyammo':
-                self.state['Credits'] -= entry.get('Cost', 0)
+            elif event_type == "buyammo":
+                self._state["Credits"] -= entry.get("Cost", 0)
 
-            elif event_type == 'communitygoalreward':
-                self.state['Credits'] += entry.get('Reward', 0)
+            elif event_type == "communitygoalreward":
+                self._state["Credits"] += entry.get("Reward", 0)
 
-            elif event_type == 'crewhire':
-                self.state['Credits'] -= entry.get('Cost', 0)
+            elif event_type == "crewhire":
+                self._state["Credits"] -= entry.get("Cost", 0)
 
-            elif event_type == 'fetchremotemodule':
-                self.state['Credits'] -= entry.get('TransferCost', 0)
+            elif event_type == "fetchremotemodule":
+                self._state["Credits"] -= entry.get("TransferCost", 0)
 
-            elif event_type == 'missionabandoned':
+            elif event_type == "missionabandoned":
                 # Is this paid at this point, or just a fine to pay later ?
-                # self.state['Credits'] -= entry.get('Fine', 0)
+                # self._state['Credits'] -= entry.get('Fine', 0)
                 pass
 
-            elif event_type in ('paybounties', 'payfines', 'paylegacyfines'):
-                self.state['Credits'] -= entry.get('Amount', 0)
+            elif event_type in ("paybounties", "payfines", "paylegacyfines"):
+                self._state["Credits"] -= entry.get("Amount", 0)
 
-            elif event_type == 'redeemvoucher':
-                self.state['Credits'] += entry.get('Amount', 0)
+            elif event_type == "redeemvoucher":
+                self._state["Credits"] += entry.get("Amount", 0)
 
-            elif event_type in ('refuelall', 'refuelpartial', 'repair', 'repairall', 'restockvehicle'):
-                self.state['Credits'] -= entry.get('Cost', 0)
+            elif event_type in (
+                "refuelall",
+                "refuelpartial",
+                "repair",
+                "repairall",
+                "restockvehicle",
+            ):
+                self._state["Credits"] -= entry.get("Cost", 0)
 
-            elif event_type == 'sellshiponrebuy':
-                self.state['Credits'] += entry.get('ShipPrice', 0)
+            elif event_type == "sellshiponrebuy":
+                self._state["Credits"] += entry.get("ShipPrice", 0)
 
-            elif event_type == 'shipyardsell':
-                self.state['Credits'] += entry.get('ShipPrice', 0)
+            elif event_type == "shipyardsell":
+                self._state["Credits"] += entry.get("ShipPrice", 0)
 
-            elif event_type == 'shipyardtransfer':
-                self.state['Credits'] -= entry.get('TransferPrice', 0)
+            elif event_type == "shipyardtransfer":
+                self._state["Credits"] -= entry.get("TransferPrice", 0)
 
-            elif event_type == 'powerplayfasttrack':
-                self.state['Credits'] -= entry.get('Cost', 0)
+            elif event_type == "powerplayfasttrack":
+                self._state["Credits"] -= entry.get("Cost", 0)
 
-            elif event_type == 'powerplaysalary':
-                self.state['Credits'] += entry.get('Amount', 0)
+            elif event_type == "powerplaysalary":
+                self._state["Credits"] += entry.get("Amount", 0)
 
-            elif event_type == 'squadroncreated':
+            elif event_type == "squadroncreated":
                 # v30 docs don't actually say anything about credits cost
                 pass
 
-            elif event_type == 'carrierbuy':
-                self.state['Credits'] -= entry.get('Price', 0)
+            elif event_type == "carrierbuy":
+                self._state["Credits"] -= entry.get("Price", 0)
 
-            elif event_type == 'carrierbanktransfer':
-                if newbal := entry.get('PlayerBalance'):
-                    self.state['Credits'] = newbal
+            elif event_type == "carrierbanktransfer":
+                if newbal := entry.get("PlayerBalance"):
+                    self._state["Credits"] = newbal
 
-            elif event_type == 'carrierdecommission':
+            elif event_type == "carrierdecommission":
                 # v30 doc says nothing about citing the refund amount
                 pass
 
-            elif event_type == 'npccrewpaidwage':
-                self.state['Credits'] -= entry.get('Amount', 0)
+            elif event_type == "npccrewpaidwage":
+                self._state["Credits"] -= entry.get("Amount", 0)
 
-            elif event_type == 'resurrect':
-                self.state['Credits'] -= entry.get('Cost', 0)
+            elif event_type == "resurrect":
+                self._state["Credits"] -= entry.get("Cost", 0)
 
                 # There should be a `Backpack` event as you 'come to' in the
                 # new location, so no need to zero out BackPack here.
 
-            elif event_type == 'powerplay':
-                self.state['Powerplay']['Power'] = entry.get('Power', '')
-                self.state['Powerplay']['Rank'] = entry.get('Rank', 0)
-                self.state['Powerplay']['Merits'] = entry.get('Merits', 0)
-                self.state['Powerplay']['Votes'] = entry.get('Votes', 0)
-                self.state['Powerplay']['TimePledged'] = entry.get('TimePledged', 0)
+            elif event_type == "powerplay":
+                self._state["Powerplay"]["Power"] = entry.get("Power", "")
+                self._state["Powerplay"]["Rank"] = entry.get("Rank", 0)
+                self._state["Powerplay"]["Merits"] = entry.get("Merits", 0)
+                self._state["Powerplay"]["Votes"] = entry.get("Votes", 0)
+                self._state["Powerplay"]["TimePledged"] = entry.get("TimePledged", 0)
 
-            elif event_type == 'powerplaymerits':
-                self.state['Powerplay']['Merits'] = entry.get('TotalMerits', 0)
+            elif event_type == "powerplaymerits":
+                self._state["Powerplay"]["Merits"] = entry.get("TotalMerits", 0)
 
-            elif event_type == 'powerplayrank':
-                self.state['Powerplay']['Rank'] = entry.get('Rank', 0)
+            elif event_type == "powerplayrank":
+                self._state["Powerplay"]["Rank"] = entry.get("Rank", 0)
 
             return entry
 
         except Exception as ex:
-            logger.debug(f'Invalid journal entry:\n{line!r}\n', exc_info=ex)
-            return {'event': None}
+            logger.debug(f"Invalid journal entry:\n{line!r}\n", exc_info=ex)
+            return {"event": None}
 
     def canonicalise(self, item: str | None) -> str:
         """
@@ -1638,7 +1781,7 @@ class Journal(api.Journal):
         :return: str - The canonical name.
         """
         if not item:
-            return ''
+            return ""
 
         item = item.lower()
         match = self._RE_CANONICALISE.match(item)
@@ -1648,7 +1791,9 @@ class Journal(api.Journal):
 
         return item
 
-    def coalesce_cargo(self, raw_cargo: list[MutableMapping[str, Any]]) -> list[MutableMapping[str, Any]]:
+    def coalesce_cargo(
+        self, raw_cargo: list[MutableMapping[str, Any]]
+    ) -> list[MutableMapping[str, Any]]:
         """
         Coalesce multiple entries of the same cargo into one.
 
@@ -1665,50 +1810,217 @@ class Journal(api.Journal):
         [{'Name': 'basicmedicines', 'Name_Localised': 'BM', 'MissionID': 684359162, 'Count': 147, 'Stolen': 0},
         {'Name': 'survivalequipment', 'Name_Localised': 'SE', 'MissionID': 684358939, 'Count': 183, 'Stolen': 0}]
 
-        :param raw_cargo: Raw cargo data (usually from Cargo.json)
-        :return: Coalesced data
+        :param raw_cargo: Raw cargo schema (usually from Cargo.json)
+        :return: Coalesced schema
         """
 
-        # self.state['Cargo'].update({self.canonicalise(x['Name']): x['Count'] for x in entry['Inventory']})
+        # self._state['Cargo'].update({self.canonicalise(x['Name']): x['Count'] for x in entry['Inventory']})
         out: list[MutableMapping[str, Any]] = []
         for inventory_item in raw_cargo:
-            if not any(self.canonicalise(x['Name']) == self.canonicalise(inventory_item['Name']) for x in out):
+            if not any(
+                self.canonicalise(x["Name"])
+                == self.canonicalise(inventory_item["Name"])
+                for x in out
+            ):
                 out.append(dict(inventory_item))
                 continue
 
             # We've seen this before, update that count
             x = list(
-                filter(lambda x: self.canonicalise(x['Name']) == self.canonicalise(inventory_item['Name']), out))
+                filter(
+                    lambda x: self.canonicalise(x["Name"])
+                    == self.canonicalise(inventory_item["Name"]),
+                    out,
+                )
+            )
 
             if len(x) != 1:
-                logger.debug(f'Unexpected number of items: {len(x)} where 1 was expected. {x}')
+                logger.debug(
+                    f"Unexpected number of items: {len(x)} where 1 was expected. {x}"
+                )
 
-            x[0]['Count'] += inventory_item['Count']
+            x[0]["Count"] += inventory_item["Count"]
 
         return out
 
-    async def _parse_navroute_file(self) -> dict[str, Any] | None:
+    async def __read_navroute(
+        self, ignore_timestamp: bool = False
+    ) -> dict[str, Any] | None:
         """Read and parse NavRoute.json."""
+        if self.pending_navroute is None:
+            return None
+
         try:
-            async with await anyio.open_file(self.journal_dir / 'NavRoute.json') as f:
+            async with await anyio.open_file(self.journal_dir / "NavRoute.json") as f:
                 raw = await f.read()
         except FileNotFoundError:
-            #logger.warning("Couldn't open NavRoute.json.")
+            # logger.warning("Couldn't open NavRoute.json.")
             return None
         except Exception as e:
-            logger.exception(f'Could not open navroute file. Bailing: {e}')
+            logger.exception(f"Could not open navroute file. Bailing: {e}")
             return None
 
         try:
-            data = json.loads(raw)
-
-        except json.JSONDecodeError:
-            logger.exception('Failed to decode NavRoute.json')
+            data = orjson.loads(raw)
+        except orjson.JSONDecodeError as e:
+            logger.error(f"Failed to decode NavRoute.json: {type(e)} {e}")
             return None
 
-        if 'timestamp' not in data:  # quick sanity check
+        if "timestamp" not in data:  # quick sanity check
             return None
 
+        if (
+            not ignore_timestamp
+            and (data["timestamp"] - self.pending_navroute["timestamp"]).total_seconds()
+            > MAX_NAVROUTE_DISCREPANCY
+        ):
+            logger.warning(
+                f"The navroute.json was over {MAX_NAVROUTE_DISCREPANCY} away from the journal event"
+            )
+            return None
+        self.pending_navroute = None
+        return data
+
+    async def __read_outfitting(self, ignore_timestamp: bool = False) -> dict[str, Any] | None:
+        """Read and parse Outfitting.json."""
+        if self.pending_outfitting is None:
+            return None
+        try:
+            async with await anyio.open_file(self.journal_dir / "Outfitting.json") as f:
+                raw = await f.read()
+        except FileNotFoundError:
+            return None
+        except Exception as e:
+            logger.exception(f"Could not open outfitting file. Bailing: {e}")
+            return None
+        try:
+            data = orjson.loads(raw)
+        except orjson.JSONDecodeError as e:
+            logger.error(f"Failed to decode Outfitting.json: {type(e)} {e}")
+            return None
+        if "timestamp" not in data:
+            return None
+        if (
+            not ignore_timestamp
+            and (data["timestamp"] - self.pending_outfitting["timestamp"]).total_seconds()
+            > MAX_MARKET_DISCREPANCY
+        ):
+            logger.warning(
+                f"The Outfitting.json was over {MAX_MARKET_DISCREPANCY} away from the journal event"
+            )
+            return None
+        self.pending_outfitting = None
+        return data
+
+    async def __read_shipyard(self, ignore_timestamp: bool = False) -> dict[str, Any] | None:
+        if self.pending_shipyard is None:
+            return None
+        try:
+            async with await anyio.open_file(self.journal_dir / "Shipyard.json") as f:
+                raw = await f.read()
+        except FileNotFoundError:
+            return None
+        except Exception as e:
+            logger.exception(f"Could not open outfitting file. Bailing: {e}")
+            return None
+        try:
+            data = orjson.loads(raw)
+        except orjson.JSONDecodeError as e:
+            logger.error(f"Failed to decode Shipyard.json: {type(e)} {e}")
+            return None
+        if "timestamp" not in data:
+            return None
+        if (
+            not ignore_timestamp
+            and (data["timestamp"] - self.pending_shipyard["timestamp"]).total_seconds()
+            > MAX_MARKET_DISCREPANCY
+        ):
+            logger.warning(
+                f"The Shipyard.json was over {MAX_MARKET_DISCREPANCY} away from the journal event"
+            )
+            return None
+        self.pending_shipyard = None
+        return data
+
+
+    async def __read_market(
+        self, ignore_timestamp: bool = False
+    ) -> dict[str, Any] | None:
+        """Read and parse Market.json."""
+        if self.pending_market is None:
+            return None
+
+        try:
+            async with await anyio.open_file(self.journal_dir / "Market.json") as f:
+                raw = await f.read()
+        except FileNotFoundError:
+            # logger.warning("Couldn't open NavRoute.json.")
+            return None
+        except Exception as e:
+            logger.exception(f"Could not open market file. Bailing: {e}")
+            return None
+
+        try:
+            data = orjson.loads(raw)
+        except orjson.JSONDecodeError as e:
+            logger.error(f"Failed to decode Market.json: {type(e)} {e}")
+            return None
+
+        if "timestamp" not in data:  # quick sanity check
+            return None
+
+        if (
+            not ignore_timestamp
+            and (data["timestamp"] - self.pending_market["timestamp"]).total_seconds()
+            > MAX_MARKET_DISCREPANCY
+        ):
+            logger.warning(
+                f"The Market.json was over {MAX_MARKET_DISCREPANCY} away from the journal event"
+            )
+            return None
+        self.pending_market = None
+        return data
+
+    async def __read_fcmaterials(
+        self, ignore_timestamp: bool = False
+    ) -> dict[str, Any] | None:
+        """Read and parse Market.json."""
+        if self.pending_market is None:
+            return None
+
+        try:
+            async with await anyio.open_file(
+                self.journal_dir / "FCMaterials.json"
+            ) as f:
+                raw = await f.read()
+        except FileNotFoundError:
+            # logger.warning("Couldn't open NavRoute.json.")
+            return None
+        except Exception as e:
+            logger.exception(f"Could not open fcmaterials file. Bailing: {e}")
+            return None
+
+        try:
+            data = orjson.loads(raw)
+        except orjson.JSONDecodeError as e:
+            logger.error(f"Failed to decode FCMaterials.json: {type(e)} {e}")
+            return None
+
+        if "timestamp" not in data:  # quick sanity check
+            return None
+
+        if (
+            not ignore_timestamp
+            and (
+                data["timestamp"] - self.pending_fcmaterials["timestamp"]
+            ).total_seconds()
+            > MAX_FCMATERIALS_DISCREPANCY
+        ):
+            logger.warning(
+                f"The navroute.json was over {MAX_FCMATERIALS_DISCREPANCY} away from the journal event"
+            )
+            return None
+        self.pending_fcmaterials = None
         return data
 
     def synthesize_startup_event(self) -> dict[str, Any]:
@@ -1722,27 +2034,27 @@ class Journal(api.Journal):
         :return: Synthesized event as a dict
         """
         entry: dict[str, Any] = {
-            'timestamp':        strftime('%Y-%m-%dT%H:%M:%SZ', gmtime()),
-            'event':            'StartUp',
-            'StarSystem':       self.state['SystemName'],
-            'StarPos':          self.state['StarPos'],
-            'SystemAddress':    self.state['SystemAddress'],
-            'Population':       self.state['SystemPopulation'],
+            "timestamp": strftime("%Y-%m-%dT%H:%M:%SZ", gmtime()),
+            "event": "StartUp",
+            "StarSystem": self._state["SystemName"],
+            "StarPos": self._state["StarPos"],
+            "SystemAddress": self._state["SystemAddress"],
+            "Population": self._state["SystemPopulation"],
         }
 
-        if self.state['Body']:
-            entry['Body'] = self.state['Body']
-            entry['BodyID'] = self.state['BodyID']
-            entry['BodyType'] = self.state['BodyType']
+        if self._state["Body"]:
+            entry["Body"] = self._state["Body"]
+            entry["BodyID"] = self._state["BodyID"]
+            entry["BodyType"] = self._state["BodyType"]
 
-        if self.state['StationName']:
-            entry['Docked'] = True
-            entry['MarketID'] = self.state['MarketID']
-            entry['StationName'] = self.state['StationName']
-            entry['StationType'] = self.state['StationType']
+        if self._state["StationName"]:
+            entry["Docked"] = True
+            entry["MarketID"] = self._state["MarketID"]
+            entry["StationName"] = self._state["StationName"]
+            entry["StationType"] = self._state["StationType"]
 
         else:
-            entry['Docked'] = False
+            entry["Docked"] = False
 
         return entry
 
@@ -1756,7 +2068,10 @@ class Journal(api.Journal):
             p = self.running_process
             try:
                 with p.oneshot():
-                    if p.status() not in [psutil.STATUS_RUNNING, psutil.STATUS_SLEEPING]:
+                    if p.status() not in [
+                        psutil.STATUS_RUNNING,
+                        psutil.STATUS_SLEEPING,
+                    ]:
                         raise psutil.NoSuchProcess(p.pid)
             except psutil.NoSuchProcess:
                 # Process likely expired
@@ -1765,8 +2080,11 @@ class Journal(api.Journal):
             try:
                 edmc_process = psutil.Process()
                 edmc_user = edmc_process.username()
-                for proc in psutil.process_iter(['name', 'username']):
-                    if 'EliteDangerous' in proc.info['name'] and proc.info['username'] == edmc_user:
+                for proc in psutil.process_iter(["name", "username"]):
+                    if (
+                        "EliteDangerous" in proc.info["name"]
+                        and proc.info["username"] == edmc_user
+                    ):
                         self.running_process = proc
                         return True
             except psutil.NoSuchProcess:
@@ -1776,107 +2094,7 @@ class Journal(api.Journal):
 
     @staticmethod
     def _parse_journal_timestamp(source: str) -> float:
-        return mktime(strptime(source, '%Y-%m-%dT%H:%M:%SZ'))
-
-    async def __navroute_retry(self) -> bool:
-        """Retry reading navroute files."""
-        if self._navroute_retries_remaining == 0:
-            return False
-
-        logger.debug(f'Navroute read retry [{self._navroute_retries_remaining}]')
-        self._navroute_retries_remaining -= 1
-
-        if self._last_navroute_journal_timestamp is None:
-            logger.critical('Asked to retry for navroute but also no set time to compare? This is a bug.')
-            return False
-
-        if (file := await self._parse_navroute_file()) is None:
-            logger.debug(
-                'Failed to parse NavRoute.json. '
-                + ('Trying again' if self._navroute_retries_remaining > 0 else 'Giving up')
-            )
-            return False
-
-        # _parse_navroute_file verifies that this exists for us
-        file_time = self._parse_journal_timestamp(file['timestamp'])
-        if abs(file_time - self._last_navroute_journal_timestamp) > MAX_NAVROUTE_DISCREPANCY:
-            logger.debug(
-                f'Time discrepancy of more than {MAX_NAVROUTE_DISCREPANCY}s --'
-                f' ({abs(file_time - self._last_navroute_journal_timestamp)}).'
-                f' {"Trying again" if self._navroute_retries_remaining > 0 else "Giving up"}.'
-            )
-            return False
-
-        # Handle it being `NavRouteClear`d already
-        if file['event'].lower() == 'navrouteclear':
-            logger.info('NavRoute file contained a NavRouteClear')
-            # We do *NOT* copy into/clear the `self.state['NavRoute']`
-        else:
-            # everything is good, lets set what we need to and make sure we dont try again
-            logger.info('Successfully read NavRoute file for last NavRoute event.')
-            self.state['NavRoute'] = file
-
-        self._navroute_retries_remaining = 0
-        self._last_navroute_journal_timestamp = None
-        return True
-
-    async def __fcmaterials_retry(self) -> dict[str, Any] | None:
-        """Retry reading FCMaterials files."""
-        if self._fcmaterials_retries_remaining == 0:
-            return None
-
-        logger.debug(f'FCMaterials read retry [{self._fcmaterials_retries_remaining}]')
-        self._fcmaterials_retries_remaining -= 1
-
-        if self._last_fcmaterials_journal_timestamp is None:
-            logger.critical('Asked to retry for FCMaterials but also no set time to compare? This is a bug.')
-            return None
-
-        if (file := await self._parse_fcmaterials_file()) is None:
-            logger.debug(
-                'Failed to parse FCMaterials.json. '
-                + ('Trying again' if self._fcmaterials_retries_remaining > 0 else 'Giving up')
-            )
-            return None
-
-        # _parse_fcmaterials_file verifies that this exists for us
-        file_time = self._parse_journal_timestamp(file['timestamp'])
-        if abs(file_time - self._last_fcmaterials_journal_timestamp) > MAX_FCMATERIALS_DISCREPANCY:
-            logger.debug(
-                f'Time discrepancy of more than {MAX_FCMATERIALS_DISCREPANCY}s --'
-                f' ({abs(file_time - self._last_fcmaterials_journal_timestamp)}).'
-                f' {"Trying again" if self._fcmaterials_retries_remaining > 0 else "Giving up"}.'
-            )
-            return None
-
-        # everything is good, lets set what we need to and make sure we dont try again
-        logger.info('Successfully read FCMaterials file for last FCMaterials event.')
-        self._fcmaterials_retries_remaining = 0
-        self._last_fcmaterials_journal_timestamp = None
-        return file
-
-    async def _parse_fcmaterials_file(self) -> dict[str, Any] | None:
-        """Read and parse FCMaterials.json."""
-        try:
-
-            async with await anyio.open_file(self.journal_dir / 'FCMaterials.json') as f:
-                raw = await f.read()
-
-        except Exception as e:
-            logger.exception(f'Could not open FCMaterials file. Bailing: {e}')
-            return None
-
-        try:
-            data = json.loads(raw)
-
-        except json.JSONDecodeError:
-            logger.exception('Failed to decode FCMaterials.json')
-            return None
-
-        if 'timestamp' not in data:  # quick sanity check
-            return None
-
-        return data
+        return mktime(strptime(source, "%Y-%m-%dT%H:%M:%SZ"))
 
     def is_live_galaxy(self) -> bool:
         """
@@ -1899,42 +2117,48 @@ class Journal(api.Journal):
 
         return False
 
-    def populate_version_info(self, entry: MutableMapping[str, str], suppress: bool = False):
+    def populate_version_info(
+        self, entry: MutableMapping[str, str], suppress: bool = False
+    ):
         """
         Update game version information stored locally.
 
         :param entry: Either a Fileheader or LoadGame event
         """
         try:
-            self.state['GameLanguage'] = entry['language']
-            self.state['GameVersion'] = entry['gameversion']
-            self.state['GameBuild'] = entry['build']
-            self.version = self.state['GameVersion']
+            self._state["GameLanguage"] = entry["language"]
+            self._state["GameVersion"] = entry["gameversion"]
+            self._state["GameBuild"] = entry["build"]
+            self.version = self._state["GameVersion"]
 
             try:
-                self.version_semantic = semantic_version.Version.coerce(self.state['GameVersion'])
+                self.version_semantic = semantic_version.Version.coerce(
+                    self._state["GameVersion"]
+                )
 
             except Exception:
                 # Catching all Exceptions as this is *one* call, and we won't
                 # get caught out by any semantic_version changes.
                 self.version_semantic = None
-                logger.error(f"Couldn't coerce {self.state['GameVersion']=}")
+                logger.error(f"Couldn't coerce {self._state['GameVersion']=}")
                 pass
 
             else:
-                logger.debug(f"Parsed {self.state['GameVersion']=} into {self.version_semantic=}")
+                logger.debug(
+                    f"Parsed {self._state['GameVersion']=} into {self.version_semantic=}"
+                )
 
-            self.is_beta = any(v in self.version.lower() for v in ('alpha', 'beta'))  # type: ignore
+            self.is_beta = any(v in self.version.lower() for v in ("alpha", "beta"))  # type: ignore
         except KeyError:
             if not suppress:
                 raise
 
     def backpack_set_empty(self):
         """Set the BackPack contents to be empty."""
-        self.state['BackPack']['Component'] = defaultdict(int)
-        self.state['BackPack']['Consumable'] = defaultdict(int)
-        self.state['BackPack']['Item'] = defaultdict(int)
-        self.state['BackPack']['Data'] = defaultdict(int)
+        self._state["BackPack"]["Component"] = defaultdict(int)
+        self._state["BackPack"]["Consumable"] = defaultdict(int)
+        self._state["BackPack"]["Item"] = defaultdict(int)
+        self._state["BackPack"]["Data"] = defaultdict(int)
 
     def suit_sane_name(self, name: str) -> str:
         """
@@ -1957,17 +2181,17 @@ class Journal(api.Journal):
         # WORKAROUND 4.0.0.200 | 2021-05-27: Suit names above Grade 1 aren't localised
         #    properly by Frontier, so we do it ourselves.
         # Stage 1: Is it in `$<type>_Class<X>_Name;` form ?
-        if m := re.fullmatch(r'(?i)^\$([^_]+)_Class([0-9]+)_Name;$', name):
+        if m := re.fullmatch(r"(?i)^\$([^_]+)_Class([0-9]+)_Name;$", name):
             n, c = m.group(1, 2)
             name = n
 
         # Stage 2: Is it in `<type>_class<x>` form ?
-        elif m := re.fullmatch(r'(?i)^([^_]+)_class([0-9]+)$', name):
+        elif m := re.fullmatch(r"(?i)^([^_]+)_class([0-9]+)$", name):
             n, c = m.group(1, 2)
             name = n
 
         # Now turn either of those into a '<type> Suit' (modulo language) form
-        if loc_lookup := edmc_suit_symbol_localised.get(self.state['GameLanguage']):
+        if loc_lookup := edmc_suit_symbol_localised.get(self._state["GameLanguage"]):
             name = loc_lookup.get(name.lower(), name)
         # WORKAROUND END
 
@@ -1978,60 +2202,60 @@ class Journal(api.Journal):
 
     def suitloadout_store_from_event(self, entry) -> tuple[int, int]:
         """
-        Store Suit and SuitLoadout data from a journal event.
+        Store Suit and SuitLoadout schema from a journal event.
 
         Also use set currently in-use instances of them as being as per this
         event.
 
         :param entry: Journal entry - 'SwitchSuitLoadout' or 'SuitLoadout'
-        :return Tuple[suit_slotid, suitloadout_slotid]: The IDs we set data for.
+        :return Tuple[suit_slotid, suitloadout_slotid]: The IDs we set schema for.
         """
         # This is the full ID from Frontier, it's not a sparse array slot id
-        suitid = entry['SuitID']
+        suitid = entry["SuitID"]
 
         # Check if this looks like a suit we already have stored, so as
         # to avoid 'bad' Journal localised names.
-        suit = self.state['Suits'].get(f"{suitid}", None)
+        suit = self._state["Suits"].get(f"{suitid}", None)
         if suit is None:
-            # Initial suit containing just the data that is then embedded in
+            # Initial suit containing just the schema that is then embedded in
             # the loadout
 
             # TODO: Attempt to map SuitName_Localised to something sane, if it
             #       isn't already.
-            suitname = entry.get('SuitName_Localised', entry['SuitName'])
+            suitname = entry.get("SuitName_Localised", entry["SuitName"])
             edmc_suitname = self.suit_sane_name(suitname)
             suit = {
-                'edmcName': edmc_suitname,
-                'locName':  suitname,
+                "edmcName": edmc_suitname,
+                "locName": suitname,
             }
 
-        # Overwrite with latest data, just in case, as this can be from CAPI which may or may not have had
-        # all the data we wanted
-        suit['suitId'] = entry['SuitID']
-        suit['name'] = entry['SuitName']
-        suit['mods'] = entry['SuitMods']
+        # Overwrite with latest schema, just in case, as this can be from CAPI which may or may not have had
+        # all the schema we wanted
+        suit["suitId"] = entry["SuitID"]
+        suit["name"] = entry["SuitName"]
+        suit["mods"] = entry["SuitMods"]
 
-        suitloadout_slotid = self.suit_loadout_id_from_loadoutid(entry['LoadoutID'])
+        suitloadout_slotid = self.suit_loadout_id_from_loadoutid(entry["LoadoutID"])
         # Make the new loadout, in the CAPI format
         new_loadout = {
-            'loadoutSlotId': suitloadout_slotid,
-            'suit':          suit,
-            'name':          entry['LoadoutName'],
-            'slots':         self.suit_loadout_slots_array_to_dict(entry['Modules']),
+            "loadoutSlotId": suitloadout_slotid,
+            "suit": suit,
+            "name": entry["LoadoutName"],
+            "slots": self.suit_loadout_slots_array_to_dict(entry["Modules"]),
         }
         # Assign this loadout into our state
-        self.state['SuitLoadouts'][f"{suitloadout_slotid}"] = new_loadout
+        self._state["SuitLoadouts"][f"{suitloadout_slotid}"] = new_loadout
 
         # Now add in the extra fields for new_suit to be a 'full' Suit structure
-        suit['id'] = suit.get('id')  # Not available in 4.0.0.100 journal event
-        # Ensure the suit is in self.state['Suits']
-        self.state['Suits'][f"{suitid}"] = suit
+        suit["id"] = suit.get("id")  # Not available in 4.0.0.100 journal event
+        # Ensure the suit is in self._state['Suits']
+        self._state["Suits"][f"{suitid}"] = suit
 
         return suitid, suitloadout_slotid
 
     def suit_and_loadout_setcurrent(self, suitid: int, suitloadout_slotid: int) -> bool:
         """
-        Set self.state for SuitCurrent and SuitLoadoutCurrent as requested.
+        Set self._state for SuitCurrent and SuitLoadoutCurrent as requested.
 
         If the specified slots are unknown we abort and return False, else
         return True.
@@ -2043,14 +2267,19 @@ class Journal(api.Journal):
         str_suitid = f"{suitid}"
         str_suitloadoutid = f"{suitloadout_slotid}"
 
-        if (self.state['Suits'].get(str_suitid, False)
-                and self.state['SuitLoadouts'].get(str_suitloadoutid, False)):
-            self.state['SuitCurrent'] = self.state['Suits'][str_suitid]
-            self.state['SuitLoadoutCurrent'] = self.state['SuitLoadouts'][str_suitloadoutid]
+        if self._state["Suits"].get(str_suitid, False) and self._state[
+            "SuitLoadouts"
+        ].get(str_suitloadoutid, False):
+            self._state["SuitCurrent"] = self._state["Suits"][str_suitid]
+            self._state["SuitLoadoutCurrent"] = self._state["SuitLoadouts"][
+                str_suitloadoutid
+            ]
             return True
 
-        logger.error(f"Tried to set a suit and suitloadout where we didn't know about both: {suitid=}, "
-                     f"{str_suitloadoutid=}")
+        logger.error(
+            f"Tried to set a suit and suitloadout where we didn't know about both: {suitid=}, "
+            f"{str_suitloadoutid=}"
+        )
         return False
 
     # TODO: *This* will need refactoring and a proper validation infrastructure
@@ -2062,19 +2291,23 @@ class Journal(api.Journal):
         :param entry: Journal event dict
         :return: True if passes validation, else False.
         """
-        engineers_present = 'Engineers' in entry
-        progress_present = 'Progress' in entry
+        engineers_present = "Engineers" in entry
+        progress_present = "Progress" in entry
 
         if not (engineers_present or progress_present):
-            logger.warning(f"EngineerProgress has neither 'Engineers' nor 'Progress': {entry=}")
+            logger.warning(
+                f"EngineerProgress has neither 'Engineers' nor 'Progress': {entry=}"
+            )
             return False
 
         if engineers_present and progress_present:
-            logger.warning(f"EngineerProgress has BOTH 'Engineers' and 'Progress': {entry=}")
+            logger.warning(
+                f"EngineerProgress has BOTH 'Engineers' and 'Progress': {entry=}"
+            )
             return False
 
         if engineers_present:
-            engineers = entry['Engineers']
+            engineers = entry["Engineers"]
             # 'Engineers' version should have a list as value
             if not isinstance(engineers, list):
                 logger.warning(f"EngineerProgress 'Engineers' is not a list: {entry=}")
@@ -2082,21 +2315,34 @@ class Journal(api.Journal):
 
             # It should have at least one entry?  This might still be valid ?
             if len(engineers) < 1:
-                logger.warning(f"EngineerProgress 'Engineers' list is empty ?: {entry=}")
+                logger.warning(
+                    f"EngineerProgress 'Engineers' list is empty ?: {entry=}"
+                )
                 # TODO: As this might be valid, we might want to only log
                 return False
 
             # And that list should have all of these keys
             # For some Progress there's no Rank/RankProgress yet
-            required_keys = ('Engineer', 'EngineerID', 'Rank', 'Progress', 'RankProgress')
+            required_keys = (
+                "Engineer",
+                "EngineerID",
+                "Rank",
+                "Progress",
+                "RankProgress",
+            )
             for e in engineers:
                 missing_keys = [key for key in required_keys if key not in e]
-                if any(key in ('Rank', 'RankProgress') and e.get('Progress') in ('Invited', 'Known') for key in
-                       missing_keys):
+                if any(
+                    key in ("Rank", "RankProgress")
+                    and e.get("Progress") in ("Invited", "Known")
+                    for key in missing_keys
+                ):
                     continue
 
                 if missing_keys:
-                    logger.warning(f"Engineer entry without '{missing_keys[0]}' key: {e=} in {entry=}")
+                    logger.warning(
+                        f"Engineer entry without '{missing_keys[0]}' key: {e=} in {entry=}"
+                    )
                     return False
 
         if progress_present:
@@ -2107,12 +2353,23 @@ class Journal(api.Journal):
             #   "EngineerID":300100,
             #   "Progress":"Invited" }
             # For some Progress there's no Rank/RankProgress yet
-            required_keys = ('Engineer', 'EngineerID', 'Rank', 'Progress', 'RankProgress')
+            required_keys = (
+                "Engineer",
+                "EngineerID",
+                "Rank",
+                "Progress",
+                "RankProgress",
+            )
             missing_keys = [key for key in required_keys if key not in entry]
-            if any(key in ('Rank', 'RankProgress') and entry.get('Progress') in ('Invited', 'Known') for key in
-                   missing_keys):
+            if any(
+                key in ("Rank", "RankProgress")
+                and entry.get("Progress") in ("Invited", "Known")
+                for key in missing_keys
+            ):
                 if missing_keys:
-                    logger.warning(f"Progress event without '{missing_keys[0]}' key: {entry=}")
+                    logger.warning(
+                        f"Progress event without '{missing_keys[0]}' key: {entry=}"
+                    )
                     return False
 
         return True
@@ -2143,5 +2400,3 @@ class Journal(api.Journal):
             return match.group(1).capitalize()
 
         return item.capitalize()
-
-
