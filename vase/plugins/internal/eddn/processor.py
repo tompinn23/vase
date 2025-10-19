@@ -528,10 +528,20 @@ class EDDNProcessor(Processor):
             eddn["$schemaRef"] = self.schema_ref("https://eddn.edcd.io/schemas/scanbarycentre/1")
             eddn["message"] = message
         elif event_type == "shipyard":
-            message ={
-
+            message = {
+                "timestamp": event["timestamp"],
+                "systemName": event["StarSystem"],
+                "stationName": event["StationName"],
+                "marketId": event["MarketID"],
+                "horizons": journal.state["Horizons"],
+                "odyssey": journal.state["Odyssey"],
+                "allowCobraMkIV": event["AllowCobraMkIV"],
+                "ships": [
+                    x["ShipType"] for x in event["PriceList"]
+                ]
             }
-            pass
+            eddn["$schemaRef"] = self.schema_ref("https://eddn.edcd.io/schemas/shipyard/2")
+            eddn["message"] = message
         else:
             return False
 
