@@ -1,9 +1,8 @@
 import logging
 import re
-from typing import Tuple
+from typing import Any, Tuple
 
 import httpx
-from watchdog.observers.fsevents2 import message
 
 from vase.api import Journal, JournalEvent, Processor, Config
 from vase.config import appversion
@@ -24,13 +23,34 @@ class EDDNProcessor(Processor):
     testing: bool
     eddn_url: str
 
-    fss_signals: bool = False # When we detect an fsssignaldiscovered
-    signal_list: list | None = None
-
     state: dict[str, dict]
 
     def __init__(self):
+        self.validator = None  # or initialize properly
+        self.actually_push = False
+        self.testing = False
+        self.eddn_url = ""
+        self.state = {}  # Initialize the state dictionary
         pass
+
+    def __init_state(self, journal: Journal) -> None:
+        if journal.cmdr in self.state:
+            return
+        else:
+            self.state[journal.cmdr] = {
+                "fss_signals": False,
+                "signals_list": None,
+            }
+
+    def set_state(self, journal: Journal, key: str, value : Any) -> None:
+        self.state[journal.cmdr][key] = value
+
+    def get_state(self, journal: Journal, key: str) -> Any:
+        if journal.cmdr not in self.state:
+            return None
+        else:
+            return self.state[journal.cmdr][key]
+
 
     @property
     def internal_name(self) -> str:
@@ -51,8 +71,7 @@ class EDDNProcessor(Processor):
 
     @staticmethod
     def check_system_name(
-        journal: Journal, event: JournalEvent, name: str = "System"
-    ) -> bool:
+        journal: Journal, event: JournalEvent, name: str) -> bool:
         return journal.state["SystemName"] == event[name]
 
     @staticmethod
@@ -61,7 +80,7 @@ class EDDNProcessor(Processor):
 
     @staticmethod
     def check_star_pos(journal: Journal, event: JournalEvent) -> bool:
-        return journal.state["StarPos"] == event["StarPos"]
+        return list(journal.state["StarPos"]) == event["StarPos"]
 
     @staticmethod
     def add_optional(message: dict, event: JournalEvent, name: str) -> None:
@@ -135,6 +154,7 @@ class EDDNProcessor(Processor):
         logger.debug(f"EDDN Message: {eddn}")
         validation_result = self.validator.validate(eddn)
         if validation_result.severity != ValidationSeverity.OK:
+            logger.error(f"EDDN MESSAGE: {eddn}")
             logger.error(
                 f"EDDN Message failed validation: {validation_result.messages}"
             )
@@ -152,7 +172,7 @@ class EDDNProcessor(Processor):
             # failed cross validation
             if not (
                 self.check_system_address(journal, event)
-                and self.check_system_name(journal, event)
+                and self.check_system_name(journal, event, "System")
             ):
                 return False
 
@@ -160,7 +180,7 @@ class EDDNProcessor(Processor):
                 "event": "CodexEntry",
                 "horizons": journal.state["Horizons"],
                 "odyssey": journal.state["Odyssey"],
-                "StarPos": journal.state["StarPos"],
+                "StarPos": list(journal.state["StarPos"]),
                 **self.pick_keys(
                     event,
                     "timestamp",
@@ -190,14 +210,14 @@ class EDDNProcessor(Processor):
             # cross check the star system data
             if not (
                 self.check_system_address(journal, event)
-                and self.check_system_name(journal, event)
+                and self.check_system_name(journal, event, "StarSystem")
             ):
                 return False
             message = {
                 "event": "Docked",
                 "horizons": journal.state["Horizons"],
                 "odyssey": journal.state["Odyssey"],
-                "StarPos": journal.state["StarPos"],
+                "StarPos": list(journal.state["StarPos"]),
                 **self.pick_not_keys(
                     event,
                     ["event", "Wanted", "ActiveFine", "CockpitBreach"],
@@ -223,23 +243,21 @@ class EDDNProcessor(Processor):
                         "JumpDist",
                         "Factions",
                     ],
-                ),
+                )
             }
             if "Factions" in event:
-                message["Factions"] = (
-                    [
+                message["Factions"] = [
                         self.pick_not_keys(
                             x,
                             [
                                 "HappiestSystem",
                                 "HomeSystem",
-                                "MyRepuation",
+                                "MyReputation",
                                 "SquadronFaction",
                             ],
                         )
                         for x in event["Factions"]
-                    ],
-                )
+                    ]
             eddn["$schemaRef"] = self.schema_ref(
                 "https://eddn.edcd.io/schemas/journal/1"
             )
@@ -248,13 +266,14 @@ class EDDNProcessor(Processor):
             # cross-check the star system data
             if not (
                 self.check_system_address(journal, event)
-                and self.check_system_name(journal, event)
+                and self.check_system_name(journal, event, "StarSystem")
             ):
                 return False
             message = {
                 "event": "Scan",
                 "horizons": journal.state["Horizons"],
                 "odyssey": journal.state["Odyssey"],
+                "StarPos": list(journal.state["StarPos"]),
                 **self.pick_not_keys(event, ["event"]),
             }
             eddn["$schemaRef"] = self.schema_ref(
@@ -272,20 +291,18 @@ class EDDNProcessor(Processor):
                 ),
             }
             if "Factions" in event:
-                message["Factions"] = (
-                    [
+                message["Factions"] = [
                         self.pick_not_keys(
                             x,
                             [
                                 "HappiestSystem",
                                 "HomeSystem",
-                                "MyRepuation",
+                                "MyReputation",
                                 "SquadronFaction",
                             ],
                         )
                         for x in event["Factions"]
-                    ],
-                )
+                    ]
 
             eddn["$schemaRef"] = self.schema_ref(
                 "https://eddn.edcd.io/schemas/journal/1"
@@ -347,8 +364,8 @@ class EDDNProcessor(Processor):
                 "systemName": journal.state["SystemName"],
                 "stationName": journal.state["StationName"],
                 "name": event["Type"],
-                "prohibited": event["IllegalGoods"],
                 "marketId": event["MarketID"],
+                "sellPrice": event["SellPrice"],
                 **self.pick_not_keys(
                     event,
                     [
@@ -360,9 +377,13 @@ class EDDNProcessor(Processor):
                         "AvgPricePaid",
                         "StolenGoods",
                         "BlackMarket",
+                        "SellPrice"
                     ],
                 ),
             }
+            if "IllegalGoods" in event:
+                message["prohibited"] = event["IllegalGoods"],
+
             eddn["$schemaRef"] = self.schema_ref(
                 "https://eddn.edcd.io/schemas/blackmarket/1"
             )
@@ -423,6 +444,8 @@ class EDDNProcessor(Processor):
                                  "LandingPad"
                                  )
             }
+            eddn["$schemaRef"] = self.schema_ref("https://eddn.edcd.io/schemas/dockinggranted/1")
+            eddn["message"] = message
         elif event_type == "fcmaterials":
             message = {
                 "timestamp": event["timestamp"],
@@ -453,14 +476,14 @@ class EDDNProcessor(Processor):
             # cross check the star system data
             if not (
                 self.check_system_address(journal, event)
-                and self.check_system_name(journal, event)
+                and self.check_system_name(journal, event, "SystemName")
             ):
                 return False
             message = {
                 "event": "FSSallBodiesFound",
                 "horizons": journal.state["Horizons"],
                 "odyssey": journal.state["Odyssey"],
-                "StarPos": journal.state["StarPos"],
+                "StarPos": list(journal.state["StarPos"]),
                 **self.pick_keys(event, "timestamp", "SystemName", "SystemAddress", "Count")
             }
             eddn["$schemaRef"] = self.schema_ref("https://eddn.edcd.io/schemas/fssallbodiesfound/1")
@@ -483,8 +506,8 @@ class EDDNProcessor(Processor):
                 "event": "NavBeaconScan",
                 "horizons": journal.state["Horizons"],
                 "odyssey": journal.state["Odyssey"],
-                "StarPos": journal.state["StarPos"],
-                "StarSystem": journal.state["StarSystem"],
+                "StarPos": list(journal.state["StarPos"]),
+                "StarSystem": journal.state["SystemName"],
                 **self.pick_keys(event, "timestamp", "SystemAddress", "NumBodies")
             }
             eddn["$schemaRef"] = self.schema_ref("https://eddn.edcd.io/schemas/navbeaconscan/1")
@@ -515,14 +538,14 @@ class EDDNProcessor(Processor):
         elif event_type == "scanbarycentre":
             if not (
                 self.check_system_address(journal, event)
-                and self.check_system_name(journal, event)
+                and self.check_system_name(journal, event, "StarSystem")
             ):
                 return None
             message = {
                 "event": "ScanBaryCentre",
                 "horizons": journal.state["Horizons"],
                 "odyssey": journal.state["Odyssey"],
-                "StarPos": journal.state["StarPos"],
+                "StarPos": list(journal.state["StarPos"]),
                 **self.pick_keys(event, "timestamp", "StarSystem", "SystemAddress", "BodyID", "SemiMajorAxis", "Eccentricity", "OrbitalInclination", "Periapsis", "OrbitalPeriod", "AscendingNode", "MeanAnomaly")
             }
             eddn["$schemaRef"] = self.schema_ref("https://eddn.edcd.io/schemas/scanbarycentre/1")
@@ -550,29 +573,31 @@ class EDDNProcessor(Processor):
     def __fss_signals(self, journal: Journal, event: JournalEvent) -> Tuple[dict | None, bool]:
         event_type = event["event"].lower()
         if event_type == "fsssignaldiscovered":
-            if self.signal_list is None:
-                self.fss_signals = True
-                self.signal_list = [event]
+            if self.get_state(journal, "signals_list") is None:
+                self.set_state(journal, "fss_signals", True)
+                self.set_state(journal, "signals_list", [event])
             else:
-                self.signal_list.append(event)
+                self.get_state(journal, "signals_list").append(event)
         else:
-            self.fss_signals = False
-            if len(self.signal_list) == 0:
-                self.signal_list = None
+            self.set_state(journal, "fss_signals", False)
+            signals = self.get_state(journal, "signals_list")
+            self.set_state(journal, "signals_list", None)
+            if len(signals) == 0:
                 return None, True
+
             message = {
-                "timestamp": self.fss_signals[0]["timestamp"],
+                "timestamp": signals[0]["timestamp"],
                 "event": "FSSSignalDiscovered",
                 "horizons": journal.state["Horizons"],
                 "odyssey": journal.state["Odyssey"],
                 "SystemAddress": journal.state["SystemAddress"],
-                "StarSystem": journal.state["StarSystem"],
-                "StarPos": journal.state["StarPos"],
+                "StarSystem": journal.state["SystemName"],
+                "StarPos": list(journal.state["StarPos"]),
                 "signals": [
                     {
                         **self.pick_keys(x, "timestamp","SignalName","SignalType", "IsStation", "USSType", "SpawningState", "SpawningFaction", "SpawningPower", "OpposingPower", "ThreatLevel")
                     }
-                    for x in self.signal_list if x["SystemAddress"] == journal.state["SystemAddress"] and x["USSType"] != "USS_Type_MissionTarget;"
+                    for x in signals if x["SystemAddress"] == journal.state["SystemAddress"] and ("USSType" not in x or x["USSType"] != "USS_Type_MissionTarget;")
                 ]
             }
             if len(message["signals"]) == 0:
@@ -586,6 +611,9 @@ class EDDNProcessor(Processor):
             return
 
         event_type = event["event"].lower()
+
+        if event_type == "startup": # will be synthesized if game already running setup per journal state.
+            self.__init_state(journal)
 
         event = self.deep_pattern_removal(event, ["_Localised$"])
 
@@ -601,7 +629,7 @@ class EDDNProcessor(Processor):
             "message": {},
         }
 
-        if event_type == "fsssignaldiscovered" or self.fss_signals:
+        if event_type == "fsssignaldiscovered" or self.get_state(journal, "fss_signals"):
             message, leftover = self.__fss_signals(journal, event)
             if message is not None:
                 eddn["$schemaRef"] = self.schema_ref("https://eddn.edcd.io/schemas/fsssignaldiscovered/1")
@@ -609,5 +637,5 @@ class EDDNProcessor(Processor):
                 await self.post_message(eddn)
             if not leftover:
                 return
-        if self.__process_event(journal, event):
+        if self.__process_event(journal, event, eddn):
             await self.post_message(eddn)

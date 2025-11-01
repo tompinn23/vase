@@ -70,9 +70,12 @@ class ColoredFormatter(logging.Formatter):
 
 ch = logging.StreamHandler()
 ch.setFormatter(ColoredFormatter())
-logging.basicConfig(level=config.get_str("log_level", default="DEBUG"), handlers=[ch])
+logging.basicConfig(level=config.get_str("log_level", default="INFO"), handlers=[ch])
 
-logging.getLogger("watchfiles.main").addFilter(IgnoreRustNotify())
+
+watchfiles_logger = logging.getLogger("watchfiles.main")
+watchfiles_logger.addFilter(IgnoreRustNotify())
+watchfiles_logger.setLevel(logging.WARNING)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 

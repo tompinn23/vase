@@ -11,6 +11,7 @@ from os import SEEK_SET
 from os.path import isdir
 from time import strptime, mktime, strftime, gmtime
 from typing import MutableMapping, Any, AsyncGenerator
+from enum import Flag, auto
 
 import anyio
 import orjson
@@ -37,6 +38,56 @@ logger = logging.getLogger(__name__)
 MAX_NAVROUTE_DISCREPANCY = 5  # Timestamp difference in seconds
 MAX_FCMATERIALS_DISCREPANCY = 5  # Timestamp difference in seconds
 MAX_MARKET_DISCREPANCY = 5  # Timestamp difference in seconds
+
+
+class Status(Flag):
+    JOURNAL = auto()
+    FILE = auto()
+
+class PendingEvent:
+
+    def __init__(self, event_name: str):
+        self.event_name = event_name
+        self.state: Status = Status(0)
+        self.journal: MutableMapping[str, Any] | None = None
+        self.file: MutableMapping[str, Any] | None = None
+
+    def journal_event(self, event: MutableMapping[str, Any]):
+        if Status.JOURNAL in self.state:
+            logger.warning(f"Second incoming journal event for {self.event_name} without flushing")
+        self.state |= Status.JOURNAL
+        self.journal = event
+
+    def file_event(self, event: MutableMapping[str, Any]):
+        if Status.FILE in self.state:
+            logger.warning(f"Second incoming file event for {self.event_name} without flushing")
+        self.state |= Status.FILE
+        self.file = event
+
+    def check_timestamp(self, delta: int) -> bool:
+        if self.file is None or self.journal is None:
+            return False
+        if "timestamp" not in self.file or "timestamp" not in self.journal:
+            return False
+        jtime = mktime(strptime(self.journal["timestamp"], "%Y-%m-%dT%H:%M:%SZ"))
+        ftime = mktime(strptime(self.file["timestamp"], "%Y-%m-%dT%H:%M:%SZ"))
+        if abs(jtime - ftime) > delta:
+            logger.warning(f"The event and file for {self.event_name} is more than {delta} seconds out")
+            return False
+        return True
+
+    def data(self, delta: int) -> MutableMapping[str, Any] | None:
+        if self.state == (Status.JOURNAL | Status.FILE) and self.check_timestamp(delta):
+            self.state = Status(0)
+            x = self.file
+            self.journal = None
+            self.file = None
+            return x
+        return None
+
+
+
+
 
 
 class Journal(api.Journal):
@@ -70,14 +121,16 @@ class Journal(api.Journal):
         self.slef: str | None = None
         self.stationservices = None
 
+        self.capture_status: bool = False
+
         self.session_start: int = int(time.time())
         self.status: dict[str, Any] = {}
 
-        self.pending_navroute: dict | None = None
-        self.pending_outfitting: dict | None = None
-        self.pending_fcmaterials: dict | None = None
-        self.pending_market: dict | None = None
-        self.pending_shipyard: dict | None = None
+        self.pending_navroute: PendingEvent = PendingEvent("NavRoute")
+        self.pending_outfitting: PendingEvent = PendingEvent("Outfitting")
+        self.pending_fcmaterials: PendingEvent = PendingEvent("FCMaterials")
+        self.pending_market: PendingEvent = PendingEvent("Market")
+        self.pending_shipyard: PendingEvent = PendingEvent("Shipyard")
 
         self.carrier_ids: dict[int, str] = {}
         self.live_galaxy_base_version = semantic_version.Version("4.0.0")
@@ -208,12 +261,13 @@ class Journal(api.Journal):
                     await self.parse_entry(line)
                 except Exception as e:
                     logger.debug(f"Invalid journal entry:\n{line!r}\n", exc_info=e)
-                navroute = await self.__read_navroute()
-                if navroute is not None:
-                    self._state["NavRoute"] = navroute
 
-                self.replay = False
-                log_pos = await loghandle.tell()
+            navroute = await self.__read_navroute()
+            if navroute is not None:
+                self._state["NavRoute"] = navroute
+
+            self.replay = False
+            log_pos = await loghandle.tell()
         else:
             loghandle = None
 
@@ -258,7 +312,7 @@ class Journal(api.Journal):
                                 f"Invalid journal entry:\n{line!r}\n", exc_info=e
                             )
                     log_pos = await loghandle.tell()
-                if event in (Change.modified, Change.added) and name == "Status.json":
+                if event in (Change.modified, Change.added) and name == "Status.json" and self.capture_status:
                     await self.process_status()
                     yield self.status
                 if event in (Change.added, Change.modified) and name == "Outfitting.json":
@@ -1430,20 +1484,20 @@ class Journal(api.Journal):
                 self._state["Taxi"] = False
 
             elif event_type == "market" and not self.replay:
-                self.pending_market = entry
-                return {}
+                self.pending_market.journal_event(entry)
+                return self.pending_market.data(MAX_MARKET_DISCREPANCY)
             elif event_type == "shipyard" and not self.replay:
-                self.pending_shipyard = entry
-                return {}
+                self.pending_shipyard.journal_event(entry)
+                return self.pending_shipyard.data(MAX_MARKET_DISCREPANCY)
             elif event_type == "navroute" and not self.replay:
-                self.pending_navroute = entry
-                return {}
+                self.pending_navroute.journal_event(entry)
+                return self.pending_navroute.data(MAX_NAVROUTE_DISCREPANCY)
             elif event_type == "outfitting" and not self.replay:
-                self.pending_outfitting = entry
-                return {}
+                self.pending_outfitting.journal_event(entry)
+                return self.pending_outfitting.data(MAX_MARKET_DISCREPANCY)
             elif event_type == "fcmaterials" and not self.replay:
-                self.pending_fcmaterials = entry
-                return {}
+                self.pending_fcmaterials.journal_event(entry)
+                return self.pending_fcmaterials.data(MAX_MARKET_DISCREPANCY)
             elif event_type == "moduleinfo":
                 async with await anyio.open_file(
                     self.journal_dir / "ModulesInfo.json", "r"
@@ -1868,23 +1922,11 @@ class Journal(api.Journal):
 
         if "timestamp" not in data:  # quick sanity check
             return None
-
-        if (
-            not ignore_timestamp
-            and (data["timestamp"] - self.pending_navroute["timestamp"]).total_seconds()
-            > MAX_NAVROUTE_DISCREPANCY
-        ):
-            logger.warning(
-                f"The navroute.json was over {MAX_NAVROUTE_DISCREPANCY} away from the journal event"
-            )
-            return None
-        self.pending_navroute = None
-        return data
+        self.pending_navroute.file_event(data)
+        return self.pending_navroute.data(MAX_NAVROUTE_DISCREPANCY)
 
     async def __read_outfitting(self, ignore_timestamp: bool = False) -> dict[str, Any] | None:
         """Read and parse Outfitting.json."""
-        if self.pending_outfitting is None:
-            return None
         try:
             async with await anyio.open_file(self.journal_dir / "Outfitting.json") as f:
                 raw = await f.read()
@@ -1898,19 +1940,8 @@ class Journal(api.Journal):
         except orjson.JSONDecodeError as e:
             logger.error(f"Failed to decode Outfitting.json: {type(e)} {e}")
             return None
-        if "timestamp" not in data:
-            return None
-        if (
-            not ignore_timestamp
-            and (data["timestamp"] - self.pending_outfitting["timestamp"]).total_seconds()
-            > MAX_MARKET_DISCREPANCY
-        ):
-            logger.warning(
-                f"The Outfitting.json was over {MAX_MARKET_DISCREPANCY} away from the journal event"
-            )
-            return None
-        self.pending_outfitting = None
-        return data
+        self.pending_outfitting.file_event(data)
+        return self.pending_outfitting.data(MAX_MARKET_DISCREPANCY)
 
     async def __read_shipyard(self, ignore_timestamp: bool = False) -> dict[str, Any] | None:
         if self.pending_shipyard is None:
@@ -1928,19 +1959,8 @@ class Journal(api.Journal):
         except orjson.JSONDecodeError as e:
             logger.error(f"Failed to decode Shipyard.json: {type(e)} {e}")
             return None
-        if "timestamp" not in data:
-            return None
-        if (
-            not ignore_timestamp
-            and (data["timestamp"] - self.pending_shipyard["timestamp"]).total_seconds()
-            > MAX_MARKET_DISCREPANCY
-        ):
-            logger.warning(
-                f"The Shipyard.json was over {MAX_MARKET_DISCREPANCY} away from the journal event"
-            )
-            return None
-        self.pending_shipyard = None
-        return data
+        self.pending_shipyard.file_event(data)
+        return self.pending_shipyard.data(MAX_MARKET_DISCREPANCY)
 
 
     async def __read_market(
@@ -1969,17 +1989,8 @@ class Journal(api.Journal):
         if "timestamp" not in data:  # quick sanity check
             return None
 
-        if (
-            not ignore_timestamp
-            and (data["timestamp"] - self.pending_market["timestamp"]).total_seconds()
-            > MAX_MARKET_DISCREPANCY
-        ):
-            logger.warning(
-                f"The Market.json was over {MAX_MARKET_DISCREPANCY} away from the journal event"
-            )
-            return None
-        self.pending_market = None
-        return data
+        self.pending_market.file_event(data)
+        return self.pending_market.data(MAX_MARKET_DISCREPANCY)
 
     async def __read_fcmaterials(
         self, ignore_timestamp: bool = False
@@ -2006,22 +2017,8 @@ class Journal(api.Journal):
             logger.error(f"Failed to decode FCMaterials.json: {type(e)} {e}")
             return None
 
-        if "timestamp" not in data:  # quick sanity check
-            return None
-
-        if (
-            not ignore_timestamp
-            and (
-                data["timestamp"] - self.pending_fcmaterials["timestamp"]
-            ).total_seconds()
-            > MAX_FCMATERIALS_DISCREPANCY
-        ):
-            logger.warning(
-                f"The navroute.json was over {MAX_FCMATERIALS_DISCREPANCY} away from the journal event"
-            )
-            return None
-        self.pending_fcmaterials = None
-        return data
+        self.pending_fcmaterials.file_event(data)
+        return self.pending_fcmaterials.data(MAX_MARKET_DISCREPANCY)
 
     def synthesize_startup_event(self) -> dict[str, Any]:
         """
@@ -2093,7 +2090,7 @@ class Journal(api.Journal):
         return bool(self.running_process)
 
     @staticmethod
-    def _parse_journal_timestamp(source: str) -> float:
+    def __parse_journal_timestamp(source: str) -> float:
         return mktime(strptime(source, "%Y-%m-%dT%H:%M:%SZ"))
 
     def is_live_galaxy(self) -> bool:
