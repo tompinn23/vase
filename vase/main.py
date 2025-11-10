@@ -18,6 +18,8 @@ import logging
 
 from vase.journal import Journal
 from vase.api.processor import Processor
+from vase.journal.base import IJournal
+from vase.journal.single import SingleJournal
 from vase.loader import load_plugins
 
 init(autoreset=True)  # reset colors automatically after each print
@@ -79,12 +81,12 @@ watchfiles_logger.setLevel(logging.WARNING)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
-async def loop(processors: list[Processor], journals: Iterable[Journal]):
+async def loop(processors: list[Processor], journals: Iterable[IJournal]):
     send, recv = anyio.create_memory_object_stream(0)
 
-    async def pump(journal: Journal):
-        async for event in journal.start():
-            await send.send((journal, event))
+    async def pump(journal: IJournal):
+        async for event in journal.events():
+            await send.send(event)
 
     async def safe_call(processor: Processor, journal, event):
         try:
@@ -119,7 +121,7 @@ async def main(args: Namespace):
         if not os.path.exists(x):
             logging.error(f'journal director "{x}" does not exist')
             continue
-        j = Journal(x)
+        j = SingleJournal(x)
         journals.append(j)
 
     async def safe_load(proc: Processor, success: list[Processor]):
