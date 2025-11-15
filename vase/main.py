@@ -3,23 +3,24 @@ import asyncio
 import os.path
 import pathlib
 import sys
+import threading
 from argparse import Namespace
 
-from typing import Iterable, MutableMapping, Any, Tuple
+from typing import Iterable
 import time
 
 import anyio
 
+from vase import gui
 from vase.api import Config
 from vase.config import config, appversion
 from colorama import Fore, Style, init
 
 import logging
 
-from vase.journal import Journal
 from vase.api.processor import Processor
 from vase.journal.base import IJournal
-from vase.journal.single import SingleJournal
+from vase.journal.multi import MultiJournal
 from vase.loader import load_plugins
 
 init(autoreset=True)  # reset colors automatically after each print
@@ -48,31 +49,34 @@ class ColoredFormatter(logging.Formatter):
         logging.ERROR: "ERROR",
     }
 
-    # Logback-style pattern: "%d{HH:mm:ss.SSS} [%thread] %-5level %logger{36} - %msg%n"
-    default_pattern = (
-        "{color}[{levelname}]{Style.RESET_ALL} {timestamp} {logger_name}: {msg}"
-    )
-
-    def __init__(self, fmt=None, datefmt="%H:%M:%S", style="{"):
-        super().__init__(fmt or self.default_pattern, datefmt=datefmt, style=style)
-
     def format(self, record):
+        # Let base class build full message (including exceptions)
+        super().format(record)
+
+        # Time formatting
         elapsed = time.monotonic() - PROGRAM_START
         seconds = int(elapsed)
         millis = int((elapsed - seconds) * 1000)
         hours, remainder = divmod(seconds, 3600)
         minutes, seconds = divmod(remainder, 60)
-        timestamp = "{:02d}:{:02d}:{:02d}.{:03d}".format(
-            hours, minutes, seconds, millis
-        )
-        logger_name = record.name.split(".")[-1]
+        timestamp = f"{hours:02}:{minutes:02}:{seconds:02}.{millis:03}"
+
+        # Color + level name
         color = self.LEVEL_COLORS.get(record.levelno, "")
-        return f"{color}{timestamp} [{self.LEVEL_NAMES.get(record.levelno, record.levelname.upper())}] {logger_name}: {record.getMessage()}"
+        level = self.LEVEL_NAMES.get(record.levelno, record.levelname.upper())
+        logger_name = record.name.split(".")[-1]
+
+        # Recombine with formatted message (which already includes exceptions)
+        return (
+            f"{color}{timestamp} [{level}]{Style.RESET_ALL} "
+            f"{logger_name}: {record.getMessage()}"
+            f"{'' if record.exc_text is None else '\n' + record.exc_text}"
+        )
 
 
 ch = logging.StreamHandler()
 ch.setFormatter(ColoredFormatter())
-logging.basicConfig(level=config.get_str("log_level", default="INFO"), handlers=[ch])
+logging.basicConfig(level=config.get_str("log_level", default="DEBUG"), handlers=[ch])
 
 
 watchfiles_logger = logging.getLogger("watchfiles.main")
@@ -115,13 +119,15 @@ async def main(args: Namespace):
 
     processors = load_plugins()
 
+    gui.bridge.set_async_loop(asyncio.get_event_loop())
+
     journals = []
     for x in args.journals:
         logging.info(f"loading journal {x}")
         if not os.path.exists(x):
-            logging.error(f'journal director "{x}" does not exist')
+            logging.error(f'journal directory "{x}" does not exist')
             continue
-        j = SingleJournal(x)
+        j = MultiJournal(x)
         journals.append(j)
 
     async def safe_load(proc: Processor, success: list[Processor]):
@@ -148,7 +154,7 @@ async def main(args: Namespace):
     )
 
     try:
-        await loop(success, journals)
+        await loop([], journals)
     except asyncio.CancelledError:
         pass
 
@@ -176,6 +182,12 @@ if __name__ == "__main__":
             help="Persist this config into the configuration file",
         )
 
-        asyncio.run(main(parser.parse_args()))
+        def run():
+            asyncio.run(main(parser.parse_args()))
+
+        threading.Thread(target=run, daemon=True).start()
+
+        gui.main()
+
     except KeyboardInterrupt:
         pass

@@ -8,13 +8,17 @@ from collections import defaultdict
 from importlib.resources import read_text
 from time import strptime, mktime, strftime, gmtime
 from enum import Flag, auto
+from datetime import datetime
+import logging
+
 
 import anyio
-import orjson
 import psutil
 import semantic_version
 from collections.abc import AsyncGenerator, MutableMapping
 from typing import Tuple, Any
+
+import xxjson
 
 from vase import data, api
 from vase.config import config, appname, appversion
@@ -27,7 +31,6 @@ from vase.edmc_data import (
 ship_data = read_text(data, "ships.json")
 ships = json.loads(ship_data)
 
-import logging
 
 logger = logging.getLogger(__name__)
 
@@ -126,7 +129,7 @@ class BaseJournal(api.Journal):
         self.mode: str | None = None
         self.group: str | None = None
         self._cmdr: str | None = None
-        self.started: int | None = None
+        self.started: datetime | None = None
         self.slef: str | None = None
         self.stationservices = None
 
@@ -259,7 +262,7 @@ class BaseJournal(api.Journal):
 
         try:
             # Preserve property order because why not?
-            entry: MutableMapping[str, Any] = json.loads(line)
+            entry: MutableMapping[str, Any] = xxjson.loads(line)
             if "timestamp" not in entry:
                 raise KeyError("Timestamp does not exist in the entry")
 
@@ -323,9 +326,7 @@ class BaseJournal(api.Journal):
                 self._state["MarketID"] = None
                 self._state["StationType"] = None
                 self.stationservices = None
-                self.started = timegm(
-                    strptime(entry["timestamp"], "%Y-%m-%dT%H:%M:%SZ")
-                )
+                self.started = entry["timestamp"]
                 # Don't set Ship, ShipID etc since this will reflect Fighter or SRV if starting in those
                 self._state.update(
                     {
@@ -863,9 +864,9 @@ class BaseJournal(api.Journal):
                 # From 3.3 full Cargo event (after the first one) is written to a separate file
                 if "Inventory" not in entry:
                     async with await anyio.open_file(
-                        self.journal_dir / "Cargo.json", "r"
+                        self.journal_dir / "Cargo.json", "rb"
                     ) as h:
-                        entry = orjson.loads(await h.read())
+                        entry = xxjson.loads(await h.read())
                         self._state["CargoJSON"] = entry
 
                 clean = self.coalesce_cargo(entry["Inventory"])
@@ -901,7 +902,9 @@ class BaseJournal(api.Journal):
                 while attempts < shiplocker_max_attempts:
                     attempts += 1
                     try:
-                        async with await anyio.open_file(shiplocker_filename, "r") as h:
+                        async with await anyio.open_file(
+                            shiplocker_filename, "rb"
+                        ) as h:
                             entry = json.loads(await h.read())
                             self._state["ShipLockerJSON"] = entry
                             break
@@ -980,7 +983,7 @@ class BaseJournal(api.Journal):
                     )
 
                 else:
-                    async with await anyio.open_file(backpack_file, "r") as h:
+                    async with await anyio.open_file(backpack_file, "rb") as h:
                         backpack_data = await h.read()
 
                 parsed: MutableMapping[str, Any] | None = None
@@ -1384,7 +1387,7 @@ class BaseJournal(api.Journal):
                 return self.pending_fcmaterials.data(MAX_MARKET_DISCREPANCY)
             elif event_type == "moduleinfo":
                 async with await anyio.open_file(
-                    self.journal_dir / "ModulesInfo.json", "r"
+                    self.journal_dir / "ModulesInfo.json", "rb"
                 ) as mf:  # type: ignore
                     try:
                         entry = json.loads(await mf.read())
@@ -1702,8 +1705,8 @@ class BaseJournal(api.Journal):
 
             return entry
 
-        except Exception as ex:
-            logger.debug(f"Invalid journal entry:\n{line!r}\n", exc_info=ex)
+        except Exception:
+            logger.debug(f"Invalid journal entry:\n{line!r}", exc_info=True)
             return {"event": None}
 
     def canonicalise(self, item: str | None) -> str:
@@ -1799,8 +1802,8 @@ class BaseJournal(api.Journal):
             return None
 
         try:
-            data = orjson.loads(raw)
-        except orjson.JSONDecodeError as e:
+            data = xxjson.loads(raw)
+        except xxjson.JSONDecodeError as e:
             logger.error(f"Failed to decode NavRoute.json: {type(e)} {e}")
             return None
 
@@ -1822,8 +1825,8 @@ class BaseJournal(api.Journal):
             logger.exception(f"Could not open outfitting file. Bailing: {e}")
             return None
         try:
-            data = orjson.loads(raw)
-        except orjson.JSONDecodeError as e:
+            data = xxjson.loads(raw)
+        except xxjson.JSONDecodeError as e:
             logger.error(f"Failed to decode Outfitting.json: {type(e)} {e}")
             return None
         self.pending_outfitting.file_event(data)
@@ -1843,8 +1846,8 @@ class BaseJournal(api.Journal):
             logger.exception(f"Could not open outfitting file. Bailing: {e}")
             return None
         try:
-            data = orjson.loads(raw)
-        except orjson.JSONDecodeError as e:
+            data = xxjson.loads(raw)
+        except xxjson.JSONDecodeError as e:
             logger.error(f"Failed to decode Shipyard.json: {type(e)} {e}")
             return None
         self.pending_shipyard.file_event(data)
@@ -1868,8 +1871,8 @@ class BaseJournal(api.Journal):
             return None
 
         try:
-            data = orjson.loads(raw)
-        except orjson.JSONDecodeError as e:
+            data = xxjson.loads(raw)
+        except xxjson.JSONDecodeError as e:
             logger.error(f"Failed to decode Market.json: {type(e)} {e}")
             return None
 
@@ -1899,8 +1902,8 @@ class BaseJournal(api.Journal):
             return None
 
         try:
-            data = orjson.loads(raw)
-        except orjson.JSONDecodeError as e:
+            data = xxjson.loads(raw)
+        except xxjson.JSONDecodeError as e:
             logger.error(f"Failed to decode FCMaterials.json: {type(e)} {e}")
             return None
 

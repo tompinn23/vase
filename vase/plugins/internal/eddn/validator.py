@@ -1,9 +1,8 @@
 from enum import IntEnum
 from importlib.resources import read_text
 
-import orjson
+import xxjson
 from jsonschema import FormatChecker, validate, ValidationError
-from orjson.orjson import JSONDecodeError
 
 from . import schema
 
@@ -63,8 +62,8 @@ class Validator:
 
         try:
             data = read_text(schema, filename)
-            self.schemas[schemaRef] = orjson.loads(data)
-        except JSONDecodeError:
+            self.schemas[schemaRef] = xxjson.loads(data)
+        except ValueError:
             raise Exception(f"Failed to load {schemaRef}")
 
     def validate(self, json):

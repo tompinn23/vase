@@ -10,13 +10,15 @@ dependencies = [
     "httpx>=0.28.1",
     "jsonschema>=4.25.1",
     "keyring>=25.6.0",
-    "orjson>=3.11.3",
     "psutil>=7.1.0",
     "pyjwt>=2.10.1",
     "pystray>=0.19.5",
+    "qasync>=0.28.0",
     "semantic-version>=2.10.0",
     "tomlkit>=0.13.3",
+    "ttkbootstrap>=1.19.0",
     "watchfiles>=1.1.1",
+    "xxjson>=0.2.0",
 ]
 
 [dependency-groups]
