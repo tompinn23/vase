@@ -14,6 +14,7 @@ dependencies = [
     "pyjwt>=2.10.1",
     "pystray>=0.19.5",
     "qasync>=0.28.0",
+    "readerwriterlock>=1.0.9",
     "semantic-version>=2.10.0",
     "tomlkit>=0.13.3",
     "ttkbootstrap>=1.19.0",

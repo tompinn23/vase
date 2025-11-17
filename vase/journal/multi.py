@@ -53,15 +53,6 @@ class JournalSession(BaseJournal):
         self.replay = False
         self.log_pos = await self.loghandle.tell()
         self.game_was_running = self.game_running()
-        if self.live:
-            if self.game_was_running:
-                logger.info("Game is/was running, synthesizing StartUp event")
-                entry = self.synthesize_startup_event()
-                return entry
-            else:
-                self.live = False
-                return None
-        return None
 
     async def reopen(self, part: int, path: pathlib.Path):
         if self.loghandle is not None:

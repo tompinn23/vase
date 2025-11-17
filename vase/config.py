@@ -1,14 +1,11 @@
 import pathlib
-import os
-import sys
-from configparser import ConfigParser
 import ctypes
 from ctypes import wintypes
-from typing import Any, Iterable
+from typing import Any
 from uuid import UUID
 import logging
 import tomlkit
-from tomlkit import table
+from readerwriterlock.rwlock import RWLockRead
 
 appname = "vase"
 
@@ -59,9 +56,14 @@ class Config:
     default_journal_path: pathlib.Path
     plugins_dir: pathlib.Path
 
+    lock: RWLockRead
+
     def __init__(self, filename: str | None = None):
+        self.lock = RWLockRead()
+
         if local_appdata := known_folder_path(LOCALAPPDATA):
             self.app_dir_path = local_appdata / appname
+
         self.app_dir_path.mkdir(exist_ok=True)
 
         self.plugins_dir = self.app_dir_path / "plugins"
@@ -71,7 +73,7 @@ class Config:
             known_folder_path(SAVEDGAMES) / "Frontier Developments" / "Elite Dangerous"
         )
 
-        self.filename = self.app_dir_path / f"config.toml"
+        self.filename = self.app_dir_path / "config.toml"
         if filename is not None:
             self.filename = pathlib.Path(filename)
 
@@ -93,25 +95,48 @@ class Config:
         return str(self.__get(table, key, default=default))
 
     def __get(self, table: str | None, key: str, *, default: str = None) -> Any:
-        if table is None:
-            return self.config.get(key, default)
-        else:
-            table = self.config.get(table, key)
+        with self.lock.gen_rlock():
             if table is None:
-                return default
-            return table.get(key, default)
+                return self.config.get(key, default)
+            else:
+                table = self.config.get(table, key)
+                if table is None:
+                    return default
+                return table.get(key, default)
 
     def add_journal(self, name: str, path: pathlib.Path) -> None:
-        tab = tomlkit.table()
-        tab.add("path", path)
-        self.config.add(f"journal.{name}", tab)
+        with self.lock.gen_wlock():
+            journals = self.config.get("journals")
 
-    def get_journals(self) -> dict[str, str]:
-        return self.config.get("journals", {})
+            # If the section disappeared somehow
+            if journals is None:
+                journals = self.config["journals"] = []
+
+            entry = tomlkit.table()
+            entry.add("name", name)
+            entry.add("path", str(path))
+
+            journals.append(entry)
+
+    def get_journals(self) -> list:
+        with self.lock.gen_rlock():
+            return self.config.get(
+                "journals", [{"name": "<unknown>", "path": self.default_journal_path}]
+            )
+
+    def set_journals(self, new: list) -> None:
+        with self.lock.gen_wlock():
+            journals = []
+            for x in new:
+                entry = tomlkit.table()
+                entry.update(x)
+                journals.append(entry)
+            self.config["journals"] = journals
 
     def save(self) -> None:
-        with open(self.filename, "w", encoding="utf-8") as f:
-            tomlkit.dump(self.config, f)
+        with self.lock.gen_wlock():
+            with open(self.filename, "w", encoding="utf-8") as f:
+                tomlkit.dump(self.config, f)
 
 
 config = Config()

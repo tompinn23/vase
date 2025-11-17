@@ -18,8 +18,8 @@ from vase import api
 
 logger = logging.getLogger("journal.single")
 
-class SingleJournal(BaseJournal, IJournal):
 
+class SingleJournal(BaseJournal, IJournal):
     def newest_journal(self, journals_dir: pathlib.Path) -> str | None:
         try:
             files = [
@@ -43,7 +43,9 @@ class SingleJournal(BaseJournal, IJournal):
             return True
         return False
 
-    async def start(self) -> AsyncGenerator[Tuple[api.Journal, MutableMapping[str, Any]], None]:
+    async def events(
+        self,
+    ) -> AsyncGenerator[Tuple[api.Journal, MutableMapping[str, Any]], None]:
         if not isdir(self.journal_dir):
             logger.error(f"{self.journal_dir} is not a directory")
             return
@@ -63,7 +65,7 @@ class SingleJournal(BaseJournal, IJournal):
                 except Exception as e:
                     logger.debug(f"Invalid journal entry:\n{line!r}\n", exc_info=e)
 
-            navroute = await self.__read_navroute()
+            navroute = await self._read_navroute()
             if navroute is not None:
                 self._state["NavRoute"] = navroute
 
@@ -113,30 +115,37 @@ class SingleJournal(BaseJournal, IJournal):
                                 f"Invalid journal entry:\n{line!r}\n", exc_info=e
                             )
                     log_pos = await loghandle.tell()
-                if event in (Change.modified, Change.added) and name == "Status.json" and self.capture_status:
+                if (
+                    event in (Change.modified, Change.added)
+                    and name == "Status.json"
+                    and self.capture_status
+                ):
                     await self.process_status()
                     yield self, self.status
-                if event in (Change.added, Change.modified) and name == "Outfitting.json":
-                    entry = await self.__read_outfitting()
+                if (
+                    event in (Change.added, Change.modified)
+                    and name == "Outfitting.json"
+                ):
+                    entry = await self._read_outfitting()
                     if entry is not None:
                         yield self, entry
                 if event in (Change.added, Change.modified) and name == "NavRoute.json":
-                    entry = await self.__read_navroute()
+                    entry = await self._read_navroute()
                     if entry is not None:
                         yield self, entry
                 if event in (Change.added, Change.modified) and name == "Market.json":
-                    entry = await self.__read_market()
+                    entry = await self._read_market()
                     if entry is not None:
                         yield self, entry
                 if (
-                        event in (Change.added, Change.modified)
-                        and name == "FCMaterials.json"
+                    event in (Change.added, Change.modified)
+                    and name == "FCMaterials.json"
                 ):
-                    entry = await self.__read_fcmaterials()
+                    entry = await self._read_fcmaterials()
                     if entry is not None:
                         yield self, entry
                 if event in (Change.added, Change.modified) and name == "Shipyard.json":
-                    entry = await self.__read_shipyard()
+                    entry = await self._read_shipyard()
                     if entry is not None:
                         yield self, entry
         if self.game_was_running:

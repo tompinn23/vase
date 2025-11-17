@@ -1,7 +1,28 @@
 from abc import ABC, abstractmethod
-from typing import MutableMapping, Any
 
 from vase.api import Journal, JournalEvent, Config
+
+import tkinter as tk
+
+
+class GuiConfigurable(ABC):
+    @property
+    @abstractmethod
+    def name(self) -> str:
+        pass
+
+    @abstractmethod
+    def configure(self, config: Config, frame: tk.Frame) -> None:
+        pass
+
+    @abstractmethod
+    async def configured(self, config: Config) -> None:
+        """
+        Called when the processor is reconfigured via GUI
+        :param config:
+        :return:
+        """
+        pass
 
 
 class Processor(ABC):
@@ -13,7 +34,7 @@ class Processor(ABC):
     @property
     @abstractmethod
     def name(self) -> str:
-        return "GenericProcessor"
+        return "Generic Processor"
 
     @abstractmethod
     async def setup(self, config: Config) -> bool:

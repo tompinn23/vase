@@ -19,8 +19,10 @@ from colorama import Fore, Style, init
 import logging
 
 from vase.api.processor import Processor
+
+from vase.gui.processor import GuiProcessor
 from vase.journal.base import IJournal
-from vase.journal.multi import MultiJournal
+from vase.journal.single import SingleJournal
 from vase.loader import load_plugins
 
 init(autoreset=True)  # reset colors automatically after each print
@@ -85,49 +87,45 @@ watchfiles_logger.setLevel(logging.WARNING)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
-async def loop(processors: list[Processor], journals: Iterable[IJournal]):
+async def loop(
+    window: gui.Window, processors: list[Processor], journals: Iterable[IJournal]
+):
     send, recv = anyio.create_memory_object_stream(0)
+    tasks = anyio.Semaphore(100)
 
     async def pump(journal: IJournal):
         async for event in journal.events():
             await send.send(event)
 
     async def safe_call(processor: Processor, journal, event):
-        try:
-            await processor.process(journal, event)
-        except Exception as e:
-            logging.exception(f"Processor {processor.name} failed: {type(e)} {e}")
+        async with tasks:
+            try:
+                await processor.process(journal, event)
+            except Exception:
+                logging.debug(f"Processor {processor.name} failed", exc_info=True)
 
     async with anyio.create_task_group() as tg:
-        for journal in journals:
-            tg.start_soon(pump, journal)
+        async with send:
+            for journal in journals:
+                tg.start_soon(pump, journal)
 
-        async for journal, event in recv:
-            logging.debug(f"event received: {journal.cmdr} {event}")
-            for p in processors:
-                tg.start_soon(safe_call, p, journal, event)
-
-        await send.aclose()
-
-        # for i, result in enumerate(results):
-        #     if isinstance(result, Exception):
-        #         logging.error(f"Exception in processor \"{processors[i].name}\" ex:{result}")
+            async for journal, event in recv:
+                logging.debug(f"event received: {journal.cmdr} {event}")
+                for p in processors:
+                    tg.start_soon(safe_call, p, journal, event)
 
 
-async def main(args: Namespace):
+async def main(window: gui.Window, args: Namespace):
     logging.info(f"starting vase {appversion()} Python {sys.version}")
 
     processors = load_plugins()
 
-    gui.bridge.set_async_loop(asyncio.get_event_loop())
-
     journals = []
-    for x in args.journals:
-        logging.info(f"loading journal {x}")
-        if not os.path.exists(x):
+    for x in config.get_journals():
+        path = pathlib.Path(x["path"])
+        if not os.path.exists(path):
             logging.error(f'journal directory "{x}" does not exist')
-            continue
-        j = MultiJournal(x)
+        j = SingleJournal(path)
         journals.append(j)
 
     async def safe_load(proc: Processor, success: list[Processor]):
@@ -136,25 +134,24 @@ async def main(args: Namespace):
         else:
             logging.debug(f"Processor: {proc.name} is not enabled")
 
-    success = []
+    enabled = [GuiProcessor(window)]
     try:
         async with anyio.create_task_group() as tg:
             for x in processors:
-                tg.start_soon(safe_load, x, success)
+                tg.start_soon(safe_load, x, enabled)
     except* Exception as eg:
         for ex in eg.exceptions:
             logging.error(
                 f"Exception initializing plugin {type(ex)}, {ex}", exc_info=True
             )
 
-    config.save()
-
+    window.post_init(asyncio.get_event_loop(), enabled)
     logging.info(
-        f"starting vase with the following event processors: {[x.name for x in success]}"
+        f"starting vase with the following event processors: {[x.name for x in enabled]}"
     )
 
     try:
-        await loop([], journals)
+        await loop(window, enabled, journals)
     except asyncio.CancelledError:
         pass
 
@@ -166,13 +163,6 @@ if __name__ == "__main__":
             description="Vase collects Multiple Elite Dangerous Journal Files",
         )
         parser.add_argument(
-            "journals",
-            type=pathlib.Path,
-            nargs="*",
-            help="journal locations to process",
-            default=[config.default_journal_dir],
-        )
-        parser.add_argument(
             "-d", "--debug", action="store_true", help="Enable debug mode"
         )
         parser.add_argument(
@@ -182,12 +172,14 @@ if __name__ == "__main__":
             help="Persist this config into the configuration file",
         )
 
+        window = gui.main.setup(config)
+
         def run():
-            asyncio.run(main(parser.parse_args()))
+            asyncio.run(main(window, parser.parse_args()))
 
         threading.Thread(target=run, daemon=True).start()
 
-        gui.main()
+        window.mainloop()
 
     except KeyboardInterrupt:
         pass
