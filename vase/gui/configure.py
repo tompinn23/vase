@@ -134,6 +134,7 @@ class JournalLocations(tk.Frame):
             return
 
         self.conf.set_journals(data)
+        self.conf.save()
 
 
 class _AFrame(AsyncFrame):

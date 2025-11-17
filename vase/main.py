@@ -21,8 +21,9 @@ import logging
 from vase.api.processor import Processor
 
 from vase.gui.processor import GuiProcessor
-from vase.journal.base import IJournal
-from vase.journal.single import SingleJournal
+from vase.journal import Journal
+from vase.journal.base import JournalSource
+from vase.journal.multiplex import JournalMultiplexer
 from vase.loader import load_plugins
 
 init(autoreset=True)  # reset colors automatically after each print
@@ -88,30 +89,20 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
 async def loop(
-    window: gui.Window, processors: list[Processor], journals: Iterable[IJournal]
+    window: gui.Window, processors: list[Processor], journal: JournalSource
 ):
-    send, recv = anyio.create_memory_object_stream(0)
     tasks = anyio.Semaphore(100)
-
-    async def pump(journal: IJournal):
-        async for event in journal.events():
-            await send.send(event)
-
     async def safe_call(processor: Processor, journal, event):
-        async with tasks:
-            try:
-                await processor.process(journal, event)
-            except Exception:
-                logging.debug(f"Processor {processor.name} failed", exc_info=True)
+        try:
+            await processor.process(journal, event)
+        except Exception:
+            logging.debug(f"Processor {processor.name} failed", exc_info=True)
 
     async with anyio.create_task_group() as tg:
-        async with send:
-            for journal in journals:
-                tg.start_soon(pump, journal)
-
-            async for journal, event in recv:
-                logging.debug(f"event received: {journal.cmdr} {event}")
-                for p in processors:
+        async for journal, event in journal.events():
+            logging.debug(f"event received: {journal.cmdr} {event}")
+            for p in processors:
+                async with tasks:
                     tg.start_soon(safe_call, p, journal, event)
 
 
@@ -125,8 +116,16 @@ async def main(window: gui.Window, args: Namespace):
         path = pathlib.Path(x["path"])
         if not os.path.exists(path):
             logging.error(f'journal directory "{x}" does not exist')
-        j = SingleJournal(path)
+        j = Journal(path)
         journals.append(j)
+    journal: JournalSource
+    if len(journals) == 1:
+        journal = journals[0]
+    elif len(journals) > 1:
+        journal = JournalMultiplexer(journals)
+    else:
+        raise RuntimeError("No journals specified")
+
 
     async def safe_load(proc: Processor, success: list[Processor]):
         if await proc.setup(Config(config.config, proc.internal_name)):
@@ -144,14 +143,16 @@ async def main(window: gui.Window, args: Namespace):
             logging.error(
                 f"Exception initializing plugin {type(ex)}, {ex}", exc_info=True
             )
+    config.save()
 
     window.post_init(asyncio.get_event_loop(), enabled)
     logging.info(
         f"starting vase with the following event processors: {[x.name for x in enabled]}"
     )
 
+
     try:
-        await loop(window, enabled, journals)
+        await loop(window, enabled, journal)
     except asyncio.CancelledError:
         pass
 
@@ -177,7 +178,7 @@ if __name__ == "__main__":
         def run():
             asyncio.run(main(window, parser.parse_args()))
 
-        threading.Thread(target=run, daemon=True).start()
+        threading.Thread(name="Async Worker", target=run, daemon=True).start()
 
         window.mainloop()
 

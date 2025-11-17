@@ -1,17 +1,20 @@
 import asyncio
+import sys
 from tkinter import ttk
 import tkinter as tk
-from ttkbootstrap import constants
+
+from tkinter import constants
 
 from vase.api.helpers import after_idle
 from vase.api.processor import GuiConfigurable
 from vase.config import Config, config
 
-from ctypes import windll
 
 from vase.gui.configure import JournalConfigApp
 
-windll.shcore.SetProcessDpiAwareness(1)
+if sys.platform == "win32":
+    from ctypes import windll
+    windll.shcore.SetProcessDpiAwareness(1)
 
 
 class InfoFrame(ttk.Labelframe):
@@ -44,19 +47,18 @@ class InfoFrame(ttk.Labelframe):
         if not location or "system" not in location:
             return "<unknown>"
 
-        parts = []
+        parts = [f"  ├ System: {location['system']}"]
 
         # Always show system
-        parts.append(f"  ├─ System: {location['system']}")
 
         # Optional fields
         if "body" in location:
-            parts.append(f"  ├─ Body: {location['body']}")
+            parts.append(f"  ├ Body: {location['body']}")
         if "station" in location:
-            parts.append(f"  └─ Station: {location['station']}")
+            parts.append(f"  └ Station: {location['station']}")
         else:
             # If there's no station but body exists, fix the last prefix:
-            if parts[-1].startswith("  ├─"):
+            if parts[-1].startswith("  ├"):
                 parts[-1] = parts[-1].replace("├", "└", 1)
 
         return "\n" + "\n".join(parts)

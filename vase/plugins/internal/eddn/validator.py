@@ -1,8 +1,8 @@
 from enum import IntEnum
-from importlib.resources import read_text
+from importlib.resources import read_binary
 
 import xxjson
-from jsonschema import FormatChecker, validate, ValidationError
+from jsonschema import FormatChecker, validate, ValidationError, Validator
 
 from . import schema
 
@@ -61,7 +61,7 @@ class Validator:
             raise Exception(f"Schema {schemaRef} already exists")
 
         try:
-            data = read_text(schema, filename)
+            data = read_binary(schema, filename)
             self.schemas[schemaRef] = xxjson.loads(data)
         except ValueError:
             raise Exception(f"Failed to load {schemaRef}")

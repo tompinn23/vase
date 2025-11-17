@@ -1,24 +1,18 @@
 import pathlib
-from abc import ABC, abstractmethod
+from typing import Protocol
 
 
-class Journal(ABC):
+class Journal(Protocol):
     """
     Journal interface, the internal journal used by vase does provide more information,
     if and when the information is required by a plugin this class will be extended.
     """
 
     @property
-    @abstractmethod
-    def directory(self) -> pathlib.Path:
-        pass
+    def directory(self) -> pathlib.Path: ...
 
     @property
-    @abstractmethod
-    def cmdr(self) -> str:
-        pass
+    def cmdr(self) -> str: ...
 
     @property
-    @abstractmethod
-    def state(self) -> dict:
-        pass
+    def state(self) -> dict: ...
